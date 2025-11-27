@@ -331,7 +331,7 @@ def run_pipeline(ctx: PipelineContext):
 # --- Command-line interface ---
 if __name__ == "__main__":
     import argparse
-    version = "1.0.0"
+    version = "1.0.1"
     parser = argparse.ArgumentParser(
         description="VR we are! CLI pipeline (video → 3D SBS video, "
                     "folder → batch of images, i2i → single/multiple images one-by-one)."
@@ -525,4 +525,5 @@ if __name__ == "__main__":
             run_pipeline(ctx)
             debug_report(ctx)
         
+
 
