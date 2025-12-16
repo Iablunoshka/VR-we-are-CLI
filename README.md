@@ -1,7 +1,7 @@
 # VR we are! (CLI)
 
 Fast, cross-platform **video → stereoscopic SBS** converter powered by **Depth Anything V2**.
-Built for batch work, tuned for GPUs, and designed with a **multi-stage**, **multi-threaded** pipeline that keeps your CPU, GPU and I/O busy.
+Built for batch work, tuned for GPUs, and designed with a **multi-threaded** pipeline that keeps your CPU, GPU and I/O busy.
 
 
 
