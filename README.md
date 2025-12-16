@@ -44,14 +44,12 @@ Creation venv
 ```bash
 python -m venv venv
 ```
-Activating venv
+Activating venv *Windows*
 ```bash
-# Windows
 venv\Scripts\activate
 ```
-or
+or *Linux*
 ```bash
-# Linux
 source venv/bin/activate
 ```
 
@@ -160,7 +158,9 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 ├─ sbsutils.py           # NVENC detect, presets merge, system info, debug report
 ├─ monitor.py            # Queue/Memory monitors + plots
 ├─ presets.json          # Ready presets (video/folder)
+├─ test_cli.py           # Testing operational
 ├─ setup_env.py          # Bootstrap PyTorch/FFmpeg and requirements
+├─ torch_detect.py       # Torch check (setup_env.py component)
 ├─ requirements.txt
 └─ README.md
 ```
