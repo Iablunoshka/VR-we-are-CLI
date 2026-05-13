@@ -171,6 +171,8 @@ def init_pipeline(
     estimator.load_model(model_name,cudnn_benchmark)
     processor = estimator.processor
     device = estimator.device
+    
+    autocast = estimator.resolve_autocast_mode(autocast)
 
     # Create thread-safe queues to connect pipeline stages
     raw_q = CloseableQueue(maxsize=r_queue)  # feeders → preprocessors
@@ -328,7 +330,7 @@ def run_pipeline(ctx: PipelineContext):
 # --- Command-line interface ---
 if __name__ == "__main__":
     import argparse
-    version = "1.0.5"
+    version = "1.1.0"
     parser = argparse.ArgumentParser(
         description="VR we are! CLI pipeline (video → 3D SBS video, "
                     "folder → batch of images, i2i → single/multiple images one-by-one)."
@@ -358,8 +360,8 @@ if __name__ == "__main__":
             choices=["low", "medium", "high"],default=None,
             help="Output video quality (changes the values of -crf or -cq in ffmpeg)") 
     parser.add_argument(
-        "--autocast",type=str,choices=["bfloat16", "float16"],default=None,
-        help="Enable torch.amp.autocast on CUDA with selected dtype (default=None = disabled)")     
+        "--autocast",type=str,choices=["auto", "float16", "bfloat16"],default=None,
+        help="AMP autocast mode: auto, float16, bfloat16")  
     parser.add_argument("--input-type", type=str,
                         choices=["video", "folder", "i2i"], default="video",
                         help=("Processing mode:\n"
@@ -517,4 +519,5 @@ if __name__ == "__main__":
             run_pipeline(ctx)
             debug_report(ctx)
         
+
 
