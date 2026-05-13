@@ -359,9 +359,8 @@ if __name__ == "__main__":
     parser.add_argument("--quality", type=str,
             choices=["low", "medium", "high"],default=None,
             help="Output video quality (changes the values of -crf or -cq in ffmpeg)") 
-    parser.add_argument(
-        "--autocast",type=str,choices=["auto", "float16", "bfloat16"],default=None,
-        help="AMP autocast mode: auto, float16, bfloat16")  
+    parser.add_argument("--autocast",type=str,choices=["auto", "none", "float16", "bfloat16"],default=None,
+            help="AMP autocast mode: auto, none, float16, bfloat16")
     parser.add_argument("--input-type", type=str,
                         choices=["video", "folder", "i2i"], default="video",
                         help=("Processing mode:\n"
