@@ -1,6 +1,7 @@
 import argparse
 import os
 import glob
+import time
 import numpy as np
 import cv2
 import torch
@@ -62,7 +63,10 @@ class DepthEstimator:
         None / "float16" / "bfloat16"
         """
 
-        if autocast is None or autocast == "none":
+        if autocast is None:
+            autocast = "auto"
+
+        if autocast == "none":
             print("AMP autocast: disabled")
             return None
 
@@ -75,11 +79,11 @@ class DepthEstimator:
 
         if autocast == "auto":
             if self.bf16_supported and self.sm >= 8.9:
-                print("AMP autocast: auto -> bfloat16")
+                print(f"AMP autocast: auto -> bfloat16 (SM {self.sm:.1f})")
                 return "bfloat16"
 
             if self.sm >= 8.0:
-                print("AMP autocast: auto -> float16")
+                print(f"AMP autocast: auto -> float16 (SM {self.sm:.1f})")
                 return "float16"
 
             print(f"AMP autocast: auto -> disabled (SM {self.sm:.1f})")
@@ -90,12 +94,20 @@ class DepthEstimator:
                 print("AMP autocast: bfloat16")
                 return "bfloat16"
 
-            print("AMP autocast: bfloat16 unsupported -> float16")
-            return "float16"
+            if self.sm >= 8.0:
+                print(f"AMP autocast: bfloat16 unsupported -> float16 (SM {self.sm:.1f})")
+                return "float16"
+
+            print(f"AMP autocast: bfloat16 unsupported -> disabled (SM {self.sm:.1f})")
+            return None
 
         if autocast == "float16":
-            print("AMP autocast: float16")
-            return "float16"
+            if self.sm >= 8.0:
+                print("AMP autocast: float16")
+                return "float16"
+
+            print(f"AMP autocast: float16 requested -> disabled (SM {self.sm:.1f})")
+            return None
 
         raise ValueError(f"Unknown autocast mode: {autocast}")
 
