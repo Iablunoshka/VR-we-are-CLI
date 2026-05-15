@@ -102,7 +102,8 @@ def init_pipeline(
     symetric: bool = False,
     blur_radius: int = 19,
     video_quality: str = "medium",
-    autocast: str = None
+    autocast: str = None,
+    infer_accum_batches: int = None
     ) -> PipelineContext:
         
     """
@@ -173,6 +174,8 @@ def init_pipeline(
     device = estimator.device
     
     autocast = estimator.resolve_autocast_mode(autocast)
+    if infer_accum_batches is None:
+        infer_accum_batches = 1
 
     # Create thread-safe queues to connect pipeline stages
     raw_q = CloseableQueue(maxsize=r_queue)  # feeders → preprocessors
@@ -210,7 +213,8 @@ def init_pipeline(
         input_type=input_type,
         n_feeders=n_feeders,
         video_quality=video_quality,
-        autocast=autocast
+        autocast=autocast,
+        infer_accum_batches=infer_accum_batches
     )
     
     #if debug:
@@ -247,7 +251,7 @@ def init_pipeline(
     for _ in range(n_preprocess):
         ctx.pre_workers.append(Thread(target=PipelineContext.preprocess_worker,args=(raw_q, batch_size, estimator.processor, estimator.device, inp_q)))
         
-    ctx.gpu_worker = Thread(target=PipelineContext.gpu_worker_loop,args=(estimator, inp_q, proc_q, model_name, n_preprocess, H, W, n_processors,cudnn_benchmark,input_type,ctx.autocast))
+    ctx.gpu_worker = Thread(target=PipelineContext.gpu_worker_loop,args=(estimator, inp_q, proc_q, model_name, n_preprocess, H, W, n_processors,cudnn_benchmark,input_type,ctx.autocast,ctx.infer_accum_batches))
                             
     for _ in range(n_processors):
         ctx.processors.append(Thread(target=PipelineContext.process_worker, args=(proc_q, SBSConverter, save_q,input_type,ctx.depth_scale,ctx.depth_offset,ctx.switch_sides,ctx.symetric,ctx.blur_radius)))
@@ -367,6 +371,8 @@ if __name__ == "__main__":
                               "  video = single video\n"
                               "  folder = batch same-resolution images\n"
                               "  i2i = images one-by-one (single or mixed-resolution folder)"))
+    parser.add_argument("--infer-accum-batches", type=int, default=None,
+                    help="Number of mini-batches merged into one GPU inference (uses more VRAM)")
     parser.add_argument("--debug", action="store_true",
                     help="Enable debug mode with memory/queue monitoring")
     parser.add_argument("--preset","-p", type=str, choices=["minimum", "balance", "max_quality"],
@@ -513,7 +519,8 @@ if __name__ == "__main__":
                 switch_sides=args.switch_sides or False,
                 symetric=args.symetric or False,
                 blur_radius=args.blur_radius or 19,
-                video_quality=args.quality or "medium"
+                video_quality=args.quality or "medium",
+                infer_accum_batches=args.infer_accum_batches or None
             )
             run_pipeline(ctx)
             debug_report(ctx)
