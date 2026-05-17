@@ -174,8 +174,7 @@ def init_pipeline(
     device = estimator.device
     
     autocast = estimator.resolve_autocast_mode(autocast)
-    if infer_accum_batches is None:
-        infer_accum_batches = 1
+    infer_accum_batches = max(1, int(infer_accum_batches or 1)) if estimator.device.type == "cuda" else 1
 
     # Create thread-safe queues to connect pipeline stages
     raw_q = CloseableQueue(maxsize=r_queue)  # feeders → preprocessors
