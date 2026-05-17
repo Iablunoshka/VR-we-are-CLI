@@ -258,7 +258,7 @@ class PipelineContext:
         """
         Runs depth inference on the GPU with buffering.
         """
-        infer_accum_batches = 1 if infer_accum_batches is not  torch.cuda.is_available() else infer_accum_batches
+        infer_accum_batches = infer_accum_batches if torch.cuda.is_available() else 1
         copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         infer_accum_batches = max(1, int(infer_accum_batches))
         
