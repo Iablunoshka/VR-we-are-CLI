@@ -177,14 +177,13 @@ class ImageSBSConverter:
 
 
             # Preparing the source image in NumPy [0–255] and create a "canvas" for the SBS image twice as wide
-            current_image_np = (current_image * 255).astype(np.uint8)
             sbs_image = np.zeros((height, width * 2, 3), dtype=np.uint8)
 
             # Duplicate the source into both halves
             if mode == "Parallel":
-                sbs_image[:, width:]  = current_image_np
+                sbs_image[:, width:]  = current_image
             else:
-                sbs_image[:, :width]  = current_image_np
+                sbs_image[:, :width]  = current_image
 
 
             # Define the viewing mode (parallel, cross)
@@ -212,7 +211,7 @@ class ImageSBSConverter:
             pixel_shifts = (depth_np * depth_scale_local + depth_offset_local).astype(np.float32)# np.int32 to np.float32     
             if blur_radius>0:
                 pixel_shifts = cpu_blur(pixel_shifts,blur_radius)
-            shifted_half = apply_subpixel_shift(current_image_np, pixel_shifts, fliped)                
+            shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped)                
             sbs_image[:, fliped:fliped + width] = shifted_half[:, fliped:fliped + width]
 
             if symetric:
@@ -220,7 +219,7 @@ class ImageSBSConverter:
                 pixel_shifts = (depth_np * -depth_scale_local + depth_offset_local).astype(np.float32)# np.int32 to np.float32     
                 if blur_radius>0:
                     pixel_shifts = cpu_blur(pixel_shifts,blur_radius)
-                shifted_half = apply_subpixel_shift(current_image_np, pixel_shifts, fliped)                
+                shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped)                
                 sbs_image[:, fliped:fliped + width] = shifted_half[:, fliped:fliped + width]
                 fliped = width - fliped
 
@@ -245,7 +244,7 @@ class ImageSBSConverter:
 
             
             # Add to our batch lists
-            sbs_images.append(sbs_image.astype(np.float32) / 255.0)
+            sbs_images.append(sbs_image)
             
  
         return sbs_images
