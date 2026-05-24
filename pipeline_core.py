@@ -239,17 +239,14 @@ class PipelineContext:
             #print(f"Waited {end_c - start_c:.3f} s on converting")
             #print(f"Save queue size: {save_queue.qsize()}/{save_queue.maxsize}")
             
-            # Convert here → uint8 RGB
-            sbs_uint8 = [(img * 255).clip(0, 255).astype(np.uint8) for img in sbs_images]
-
             if input_type == "video":
                 try:
-                    save_queue.put((indices, sbs_uint8))
+                    save_queue.put((indices, sbs_images))
                 except EOFError:
                     return
             else:
                 try:
-                    save_queue.put((names, sbs_uint8))
+                    save_queue.put((names, sbs_images))
                 except EOFError:
                     return
                 
