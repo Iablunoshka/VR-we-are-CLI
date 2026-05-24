@@ -188,9 +188,7 @@ def prepare_batch(images: list[tuple[int, np.ndarray]], depth_maps: np.ndarray) 
     images_sorted = [images[i][1] for i in order]
     depth_sorted = [depth_maps[i] for i in order]
 
-    base_image = np.stack([img.astype(np.float32) / 255.0
-    for img in images_sorted
-    ], axis=0)  # shape: [B, H, W, 3]
+    base_image = np.stack([img for img in images_sorted], axis=0)  # shape: [B, H, W, 3]
 
     depth_image = np.stack(depth_sorted, axis=0).astype(np.float32)
 
@@ -272,6 +270,8 @@ def validate_config(params, parser=None):
             fail(f"Presets are available only for 'video' and 'folder' --input-type.")
         if video_quality:
             fail(f"--quality is only supported for --input-type=video")
+        if infer_accum_batches:
+            fail(f"--infer-accum-batches only for 'video' and 'folder' --input-type.")
 
     else:
         fail(f"Unknown input type: {input_type}")
