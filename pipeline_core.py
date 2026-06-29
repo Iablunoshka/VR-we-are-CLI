@@ -293,6 +293,7 @@ class PipelineContext:
 
                 with torch.cuda.stream(copy_stream):
                     copy_stream.wait_stream(compute_stream)
+                    depth_tensor.record_stream(copy_stream)
                     cpu_buf.copy_(depth_tensor, non_blocking=True)
                     ev = torch.cuda.Event(enable_timing=False)
                     ev.record(copy_stream)
