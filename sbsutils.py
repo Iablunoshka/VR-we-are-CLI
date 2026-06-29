@@ -315,7 +315,7 @@ def debug_report(ctx):
         if ctx.autocast:
             print(f"AMP autocast: {ctx.autocast}")
         if ctx.infer_accum_batches:
-            print(f"inference accumulate batches: {ctx.infer_accum_batches}")
+            print(f"Inference accumulate batches: {ctx.infer_accum_batches}")
         print(f"Queue sizes: raw={ctx.r_queue}, input={ctx.in_queue}, "
               f"process={ctx.p_queue}, save={ctx.s_queue}")
               
