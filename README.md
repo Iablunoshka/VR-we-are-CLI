@@ -126,12 +126,13 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 | **Balance** | 8 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 4 | 16 | 7,0 / 7,7 | **22.2 FPS** | Best overall performance |
 | **Max Quality** | 12 GB | Depth-Anything-V2-Large-hf | 6 | 1 | 2 | 4 | 2 | 16 | 5,0/ 5,8 | **16.7 FPS** | Highest depth accuracy, GPU-bound |
 
-###  Presets - Video Mode (Full HD)
-| Preset | Target VRAM | Model | Batch | Feeders | Preprocess | Processors | Savers | Queues (r/in/p/s) | RAM Usage (avg/max GB) | FPS | Notes |
+###  Presets - Video Mode (Full HD) 
+| Preset | Typical VRAM Usage | Model | Batch | Feeders | Preprocess | Processors | Savers | Queues (r/in/p/s) | RAM Usage (avg/max GB) | FPS | Notes |
 |:-------|:-------------|:-------|:-------|:---------|:------------|:------------|:--------|:------------------|:------------------------|:------|:------|
-| **Minimum** | 4 GB | Depth-Anything-V2-Small-hf | 3 | 1 | 1 | 4 | 1 | 6 | 4,4 / 5,0 | **19.8 FPS** | Optimized for low-VRAM/RAM system |
-| **Balance** | 8 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 1 | 16 | 8,4 / 9,8 | **21.8 FPS** | Best overall performance |
-| **Max Quality** | 12 GB | Depth-Anything-V2-Large-hf | 6 | 1 | 1 | 3 | 1 | 16 | 5,2/ 5,7 | **16.5 FPS** | Highest depth accuracy, GPU-bound |
+| **Minimum** | 2.4 GB | Depth-Anything-V2-Small-hf | 3 | 1 | 1 | 4 | 1 | 6 | 3.5 / 3.8 | **36.7 FPS** | Optimized for low-VRAM/RAM system |
+| **Balance** | 5.2 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.5 / 5.95 | **39.6 FPS** | Best overall performance |
+| **Max Quality** | 8.5 GB | Depth-Anything-V2-Large-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.3 / 5.7 | **36.6 FPS** | Highest depth accuracy, GPU-bound |
+
 
 ---
 

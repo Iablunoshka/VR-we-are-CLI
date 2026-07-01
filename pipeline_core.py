@@ -4,9 +4,12 @@ from dataclasses import dataclass, field
 import threading
 import numpy as np
 import os, time, cv2, subprocess, av, torch
-from sbsutils import force_exit , graceful_shutdown , prepare_batch 
+from sbsutils import force_exit , graceful_shutdown , prepare_batch
 from depthestimator import DepthEstimator
 from converter import ImageSBSConverter
+# --- HDR (10-bit) --- all HDR-specific logic lives in the isolated hdr module; imported by
+# function name so it never clashes with the `hdr` boolean flag threaded through the workers.
+from hdr import depth_proxy, pixel_max, pixel_dtype, pipe_in_pix_fmt, encode_color_args, make_hdr_rgb48_decoder
 
 
 
@@ -84,7 +87,13 @@ class PipelineContext:
     # etc
     fatal_error: bool = False
     video_quality: str = "medium"
-    
+
+    # --- HDR (10-bit) --- optional true-10-bit HDR output (video input only). When hdr=False the
+    hdr: bool = False
+    hdr_encoder: str = "auto"
+    master_display: str | None = None
+    max_cll: str | None = None
+
     @staticmethod
     def video_worker_thread(save_queue: Queue,video_path, output_path: str, width: int, height: int, fps: float,codec: str,crf: int, cq: int,ctx):
         """
@@ -98,7 +107,7 @@ class PipelineContext:
             "-loglevel", "info",  # quiet removes all logs
             # Input video raw (pictures from pipe)
             "-f", "rawvideo",
-            "-pix_fmt", "rgb24", 
+            "-pix_fmt", pipe_in_pix_fmt(ctx.hdr),  # rgb48le (16-bit) when hdr, else rgb24
             "-s", f"{width}x{height}",
             "-r", str(fps),
             "-i", "-",
@@ -108,8 +117,8 @@ class PipelineContext:
             "-map", "1:a:0?",
             # video
             "-c:v", codec,
-            ] + (["-crf", str(crf)] if codec in ("libx264", "libx265") else ["-rc:v", "vbr", "-cq:v", str(cq), "-b:v", "0"]) + [ 
-            "-pix_fmt", "yuv420p",
+            ] + (["-crf", str(crf)] if codec in ("libx264", "libx265") else ["-rc:v", "vbr", "-cq:v", str(cq), "-b:v", "0"]) + [
+            ] + encode_color_args(codec, ctx.hdr, ctx.master_display, ctx.max_cll) + [
             "-c:a", "copy",
             output_path
         ]
@@ -157,9 +166,11 @@ class PipelineContext:
                     proc.stdin.close()
             except Exception:
                 pass
+            # Wait for ffmpeg to finish flushing the encoder and writing the MP4 trailer.
+            # A short timeout may truncate large/slow encodes (e.g. 4K HDR).
             try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
+                proc.wait()
+            except Exception:
                 try:
                     proc.kill()
                 except Exception:
@@ -193,7 +204,7 @@ class PipelineContext:
                 cv2.imwrite(save_path, image_bgr)
     
     @staticmethod
-    def process_worker(process_queue: Queue, SBSConverter, save_queue: Queue,input_type,depth_scale,depth_offset,switch_sides,symetric,blur_radius):
+    def process_worker(process_queue: Queue, SBSConverter, save_queue: Queue,input_type,depth_scale,depth_offset,switch_sides,symetric,blur_radius,hdr=False):
         """
         Converts depth maps into SBS images and sends results to saving queue.
         """
@@ -232,13 +243,14 @@ class PipelineContext:
                 depth_offset,
                 switch_sides,
                 blur_radius,
-                symetric
+                symetric,
+                hdr                    # --- HDR (10-bit): run the warp in uint16 when set ---
             )
             
             #end_c = time.perf_counter()
             #print(f"Waited {end_c - start_c:.3f} s on converting")
             #print(f"Save queue size: {save_queue.qsize()}/{save_queue.maxsize}")
-            
+
             if input_type == "video":
                 try:
                     save_queue.put((indices, sbs_images))
@@ -356,9 +368,14 @@ class PipelineContext:
                 return
             
     @staticmethod
-    def preprocess_worker(raw_queue: Queue, batch_size: int, processor, device, input_queue: Queue):
+    def preprocess_worker(raw_queue: Queue, batch_size: int, processor, device, input_queue: Queue, hdr=False):
         """
         Loads and preprocesses frames into GPU-ready tensors (batched).
+
+        --- HDR (10-bit) --- in HDR mode the depth model is fed an 8-bit sRGB *proxy* of each frame
+        (depth_proxy/pq_to_srgb8), because a raw PQ frame looks far too dark to a model trained on
+        sRGB and the predicted depth degrades. The ORIGINAL 16-bit frames are still forwarded
+        unchanged (in `list(zip(batch_idx, batch_imgs))`) for the warp, so the output colour is HDR.
         """
 
         batch_idx, batch_imgs, batch_names = [], [], []
@@ -372,7 +389,8 @@ class PipelineContext:
             #print(f"Waited {end_wait - start_wait:.3f} s on queue.get()")
             if item is None:
                 if batch_imgs:
-                    inputs = processor(images=batch_imgs, return_tensors="pt")
+                    # --- HDR (10-bit): feed the depth model an 8-bit sRGB proxy (no-op in SDR) ---
+                    inputs = processor(images=[depth_proxy(_im, hdr) for _im in batch_imgs], return_tensors="pt")
                     
                     try:
                         input_queue.put((
@@ -404,7 +422,8 @@ class PipelineContext:
             batch_names.append(name)
             
             if len(batch_imgs) >= batch_size:
-                inputs = processor(images=batch_imgs, return_tensors="pt")
+                # --- HDR (10-bit): feed the depth model an 8-bit sRGB proxy (no-op in SDR) ---
+                inputs = processor(images=[depth_proxy(_im, hdr) for _im in batch_imgs], return_tensors="pt")
                 try:
                     input_queue.put((
                         list(batch_idx),
@@ -419,19 +438,29 @@ class PipelineContext:
 
 
     @staticmethod
-    def video_feeder(video_path, raw_queue,W_orig,H_orig,result_dict,max_frames: int | None = None):
+    def video_feeder(video_path, raw_queue,W_orig,H_orig,result_dict,max_frames: int | None = None, hdr=False):
         """
         Streams RGB frames from video using PyAV.
+
+        --- HDR (10-bit) --- decodes as 16-bit rgb48le (uint16) when hdr, else 8-bit rgb24 (uint8).
         """
         container = av.open(video_path)
         stream = container.streams.video[0]
         stream.thread_type = "AUTO"
 
+        # --- HDR (10-bit) --- PyAV's direct rgb48le conversion uses a BT.709 matrix and corrupts
+        # BT.2020 colors; route HDR frames through a colorspace-correct libavfilter graph instead
+        # (see hdr.make_hdr_rgb48_decoder). SDR keeps the fast direct to_ndarray path below.
+        hdr_decode = make_hdr_rgb48_decoder(stream) if hdr else None
+
         idx = 0
         try:
             for frame in container.decode(stream):
-                # RGB numpy array: (H, W, 3), uint8
-                img = frame.to_ndarray(format="rgb24")
+                # RGB numpy array: (H, W, 3) — uint8 (rgb24) or uint16 (rgb48le) in HDR mode
+                if hdr_decode is not None:
+                    img = hdr_decode(frame)
+                else:
+                    img = frame.to_ndarray(format=pipe_in_pix_fmt(hdr))
 
                 if img.shape[0] != H_orig or img.shape[1] != W_orig:
                     img = img[:H_orig, :W_orig]

@@ -71,10 +71,10 @@
     },
     "max_quality": {
       "model_name": "depth-anything/Depth-Anything-V2-Large-hf",
-      "batch_size": 6,
+      "batch_size": 5,
       "n_feeders": 1,
-      "n_preprocess": 1,
-      "n_processors": 3,
+      "n_preprocess": 2,
+      "n_processors": 8,
       "n_savers": 1,
       "r_queue": 16,
       "in_queue": 16,

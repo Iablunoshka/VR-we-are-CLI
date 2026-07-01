@@ -17,6 +17,8 @@ from depthestimator import DepthEstimator
 from converter import ImageSBSConverter
 from pipeline_core import PipelineContext
 from sbsutils import force_exit , debug_report , load_preset , merge_with_preset , validate_config , detect_nvenc_support
+# --- HDR (10-bit) --- isolated HDR module; imported by name to avoid clashing with the `hdr` flag.
+from hdr import select_codec
 
 
 class CloseableQueue(Queue):
@@ -103,7 +105,11 @@ def init_pipeline(
     blur_radius: int = 19,
     video_quality: str = "medium",
     autocast: str = None,
-    infer_accum_batches: int = None
+    infer_accum_batches: int = None,
+    hdr: bool = False,
+    hdr_encoder: str = "auto",
+    master_display: str = None,
+    max_cll: str = None
     ) -> PipelineContext:
         
     """
@@ -125,8 +131,11 @@ def init_pipeline(
         H, W = frame.shape[:2]
         cudnn_benchmark = True
        
-        # Encoder check
-        if not codec or codec == "auto":
+        # Encoder selection
+        if hdr:
+            # --- HDR (10-bit) --- use HEVC encoder instead of SDR H.264
+            codec = select_codec(hdr_encoder, bool(master_display))
+        elif not codec or codec == "auto":
             if W*2 <= 4096 and H <= 4096 and detect_nvenc_support():
                 codec = "h264_nvenc"
                 print("NVENC available — using GPU encoder (h264_nvenc).")
@@ -139,7 +148,7 @@ def init_pipeline(
             else:
                 codec = "libx264"
                 print("h264_nvenc not available — using CPU encoder (libx264).")
-                
+
         # Definitions of quality
         if video_quality == "low":
             crf, cq = 30, 35
@@ -213,7 +222,8 @@ def init_pipeline(
         n_feeders=n_feeders,
         video_quality=video_quality,
         autocast=autocast,
-        infer_accum_batches=infer_accum_batches
+        infer_accum_batches=infer_accum_batches,
+        hdr=hdr, master_display=master_display, max_cll=max_cll  # --- HDR (10-bit) ---
     )
     
     #if debug:
@@ -232,7 +242,7 @@ def init_pipeline(
 
     if input_type == "video":
         ctx.result_dict = {"frames": 0}
-        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(video_path, raw_q, W, H, ctx.result_dict, max_frames))]
+        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(video_path, raw_q, W, H, ctx.result_dict, max_frames, ctx.hdr))]
     elif input_type == "folder":
         ctx.result_dict = {"frames": 0} 
         chunks = np.array_split(files, n_feeders)
@@ -248,12 +258,12 @@ def init_pipeline(
         )]
     
     for _ in range(n_preprocess):
-        ctx.pre_workers.append(Thread(target=PipelineContext.preprocess_worker,args=(raw_q, batch_size, estimator.processor, estimator.device, inp_q)))
+        ctx.pre_workers.append(Thread(target=PipelineContext.preprocess_worker,args=(raw_q, batch_size, estimator.processor, estimator.device, inp_q, ctx.hdr)))
         
     ctx.gpu_worker = Thread(target=PipelineContext.gpu_worker_loop,args=(estimator, inp_q, proc_q, model_name, n_preprocess, H, W, n_processors,cudnn_benchmark,input_type,ctx.autocast,ctx.infer_accum_batches))
                             
     for _ in range(n_processors):
-        ctx.processors.append(Thread(target=PipelineContext.process_worker, args=(proc_q, SBSConverter, save_q,input_type,ctx.depth_scale,ctx.depth_offset,ctx.switch_sides,ctx.symetric,ctx.blur_radius)))
+        ctx.processors.append(Thread(target=PipelineContext.process_worker, args=(proc_q, SBSConverter, save_q,input_type,ctx.depth_scale,ctx.depth_offset,ctx.switch_sides,ctx.symetric,ctx.blur_radius,ctx.hdr)))
     
     if input_type == "video":
         for _ in range(n_savers):
@@ -409,7 +419,18 @@ if __name__ == "__main__":
                         help="Enable symmetric rendering (default=False)")
     parser.add_argument("--blur-radius", type=int, default=None,
                         help="Blur radius applied to depth map before shifting (default=19)")
-    
+
+    # --- HDR (10-bit) --- true 10-bit HDR output instead of tonemapping to SDR (video input only).
+    # See cli/sbs/hdr.py for the whole HDR path; without --hdr none of it runs.
+    parser.add_argument("--hdr",action=argparse.BooleanOptionalAction, default=None,
+                        help="Keep 10-bit HDR (PQ/BT.2020) output instead of tonemapping to SDR (video only)")
+    parser.add_argument("--hdr-encoder", type=str, choices=["auto", "nvenc", "libx265"], default=None,
+                        help="HDR HEVC encoder: auto (libx265 if HDR10 static metadata, else nvenc) | nvenc | libx265")
+    parser.add_argument("--master-display", type=str, default=None,
+                        help="HDR10 mastering-display string 'G(..)B(..)R(..)WP(..)L(..)' (libx265 only)")
+    parser.add_argument("--max-cll", type=str, default=None,
+                        help="HDR10 MaxCLL,MaxFALL e.g. '1000,400' (libx265 only)")
+
     args = parser.parse_args()
     
     # Force shutdown (Ctrl+C or SIGTERM)
@@ -519,7 +540,12 @@ if __name__ == "__main__":
                 symetric=args.symetric or False,
                 blur_radius=args.blur_radius or 19,
                 video_quality=args.quality or "medium",
-                infer_accum_batches=args.infer_accum_batches or None
+                infer_accum_batches=args.infer_accum_batches or None,
+                # --- HDR (10-bit) ---
+                hdr=args.hdr if args.hdr is not None else False,
+                hdr_encoder=args.hdr_encoder or "auto",
+                master_display=args.master_display,
+                max_cll=args.max_cll
             )
             run_pipeline(ctx)
             debug_report(ctx)

@@ -72,13 +72,15 @@ def invert_map_1d_monotonic_numba(pixel_shifts_in):
         P[y, :, 0] = xs
     return P
   
-def apply_subpixel_shift(image, pixel_shifts_in, flip_offset):
+def apply_subpixel_shift(image, pixel_shifts_in, flip_offset, out_dtype: type = np.uint8):
     """
     Performs a subpixel shift of the image depending on the shift map
 
-    image: original image (H, W, 3), uint8
+    image: original image (H, W, 3), uint8 (SDR) or uint16 (HDR 10-bit)
     pixel_shifts: shift map (H, W), float32
     flip_offset: 0 (parallel) or width (cross-eyed)
+    out_dtype: output canvas dtype; uint8 (SDR) or uint16 (HDR). cv2.remap below
+               preserves the input dtype, so the warp itself is bit-depth agnostic.
 
     Returns the left stereo frame.
     """
@@ -98,7 +100,7 @@ def apply_subpixel_shift(image, pixel_shifts_in, flip_offset):
     y_coords = y_coords.astype(np.float32)
 
     # Placement in the left half
-    sbs_result = np.zeros((H, W * 2, 3), dtype=np.uint8)
+    sbs_result = np.zeros((H, W * 2, 3), dtype=out_dtype)
 
     # monotony per line (purly related to depth scale)
     shifted_x = np.maximum.accumulate(shifted_x, axis=1)
@@ -136,8 +138,11 @@ class ImageSBSConverter:
 
 
     def process(self, base_image, depth_image, depth_scale, depth_offset, switch_sides,
-        blur_radius, symetric
+        blur_radius, symetric, hdr=False
         ):
+
+        # HDR uses uint16 frames; SDR uses uint8. Depth map stays float geometry.
+        DTYPE = np.uint16 if hdr else np.uint8
 
         #print("CONVERTING")
         #define constant
@@ -176,8 +181,13 @@ class ImageSBSConverter:
             depth_np = np.array(depth_map_resized, dtype=np.float32) - 128.0
 
 
-            # Preparing the source image in NumPy [0–255] and create a "canvas" for the SBS image twice as wide
-            sbs_image = np.zeros((height, width * 2, 3), dtype=np.uint8)
+            # Preparing the source image in NumPy and create a "canvas" for the SBS image twice as wide
+            if current_image.dtype != DTYPE:
+                raise TypeError(
+                    f"Expected {DTYPE} image for hdr={hdr}, got {current_image.dtype}"
+                )
+
+            sbs_image = np.zeros((height, width * 2, 3), dtype=DTYPE)
 
             # Duplicate the source into both halves
             if mode == "Parallel":
@@ -211,7 +221,7 @@ class ImageSBSConverter:
             pixel_shifts = (depth_np * depth_scale_local + depth_offset_local).astype(np.float32)# np.int32 to np.float32     
             if blur_radius>0:
                 pixel_shifts = cpu_blur(pixel_shifts,blur_radius)
-            shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped)                
+            shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped, DTYPE)
             sbs_image[:, fliped:fliped + width] = shifted_half[:, fliped:fliped + width]
 
             if symetric:
@@ -219,7 +229,7 @@ class ImageSBSConverter:
                 pixel_shifts = (depth_np * -depth_scale_local + depth_offset_local).astype(np.float32)# np.int32 to np.float32     
                 if blur_radius>0:
                     pixel_shifts = cpu_blur(pixel_shifts,blur_radius)
-                shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped)                
+                shifted_half = apply_subpixel_shift(current_image, pixel_shifts, fliped, DTYPE)
                 sbs_image[:, fliped:fliped + width] = shifted_half[:, fliped:fliped + width]
                 fliped = width - fliped
 
@@ -237,7 +247,7 @@ class ImageSBSConverter:
                     cv2.rectangle(sbs_image, (2*width+crop_size2, 0), (2*width -1, height - 1), fillcolor, thickness)
                         
             if switch_sides:
-                sbs_image_swapped = np.zeros((height, width * 2, 3), dtype=np.uint8)
+                sbs_image_swapped = np.zeros((height, width * 2, 3), dtype=DTYPE)
                 sbs_image_swapped[:, 0: width] = sbs_image[:, width : width + width]
                 sbs_image_swapped[:, width : width + width] = sbs_image[:, 0: width]
                 sbs_image = sbs_image_swapped

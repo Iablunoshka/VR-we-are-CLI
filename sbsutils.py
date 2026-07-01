@@ -63,22 +63,24 @@ def graceful_shutdown(ctx):
     
 def load_preset(mode: str, name: str, path: str = "presets.json") -> dict:
     base_dir = Path(__file__).resolve().parent
-    preset_path = base_dir / path
-    path = Path(path)
-    
-    if not path.exists():
-        raise FileNotFoundError(f"Preset file not found: {path.resolve()}")
-    
+    preset_path = Path(path)
+
+    if not preset_path.is_absolute():
+        preset_path = base_dir / preset_path
+
+    if not preset_path.exists():
+        raise FileNotFoundError(f"Preset file not found: {preset_path.resolve()}")
+
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(preset_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse {path.name}: {e}")
+        raise ValueError(f"Failed to parse {preset_path.name}: {e}")
 
     try:
         return data[mode][name]
-    except KeyError as e:
-        raise ValueError(f"Preset '{name}' not found for mode '{mode}' in {path}")
+    except KeyError:
+        raise ValueError(f"Preset '{name}' not found for mode '{mode}' in {preset_path}")
         
 def merge_with_preset(args: argparse.Namespace, preset_data: dict, cls_type) -> dict:
     """
@@ -188,8 +190,8 @@ def prepare_batch(images: list[tuple[int, np.ndarray]], depth_maps: np.ndarray) 
     images_sorted = [images[i][1] for i in order]
     depth_sorted = [depth_maps[i] for i in order]
 
-    base_image = np.stack([img for img in images_sorted], axis=0)  # shape: [B, H, W, 3]
-
+    # SDR stays uint8, HDR stays uint16.
+    base_image = np.stack(images_sorted, axis=0)
     depth_image = np.stack(depth_sorted, axis=0).astype(np.float32)
 
     return base_image, depth_image
@@ -210,15 +212,20 @@ def validate_config(params, parser=None):
     feeders = params.get("n_feeders") or params.get("feeders")
     savers = params.get("n_savers") or params.get("savers")
     codec = params.get("codec")
-    preset = params.get("preset") 
+    preset = params.get("preset")
     video_quality = params.get("quality")  or params.get("video_quality")
     infer_accum_batches = params.get("infer_accum_batches")
-    
+    hdr = params.get("hdr")
+
     def fail(msg):
         if parser:
             parser.error(msg)
         else:
             raise ValueError(msg)
+
+    # HDR (10-bit)
+    if hdr and input_type != "video":
+        fail("--hdr is only supported for --input-type=video")
 
     if input_type == "video":
         if input_path and not os.path.isfile(input_path):
@@ -231,7 +238,10 @@ def validate_config(params, parser=None):
             fail("--output must be a video file path (with extension .mp4/.mkv/...)")
         if infer_accum_batches is not None and infer_accum_batches < 1:
             fail("--infer-accum-batches must be >= 1")
-        
+        # --- HDR (10-bit): 10-bit HDR needs an HEVC encoder; H.264 cannot carry it. ---
+        if hdr and codec in ("libx264", "h264_nvenc"):
+            fail("--hdr needs an HEVC encoder (libx265/hevc_nvenc); drop --codec or use --hdr-encoder.")
+
 
     elif input_type == "folder":
         if input_path and not os.path.isdir(input_path):
@@ -316,6 +326,8 @@ def debug_report(ctx):
             print(f"AMP autocast: {ctx.autocast}")
         if ctx.infer_accum_batches:
             print(f"Inference accumulate batches: {ctx.infer_accum_batches}")
+        if ctx.hdr:
+            print(f"HDR: {ctx.hdr}")
         print(f"Queue sizes: raw={ctx.r_queue}, input={ctx.in_queue}, "
               f"process={ctx.p_queue}, save={ctx.s_queue}")
               
