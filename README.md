@@ -13,7 +13,8 @@ Built for batch work, tuned for GPUs, and designed with a **multi-threaded** pip
 * **Pipeline parallelism** with queues: feeder → preprocess → GPU → convert → save
 * Depth via **Depth Anything V2 (Small/Base/Large)**
 * **Debugging**: Queue/Memory Monitor and Summary Report
-* Single-file **installer** (`setup_env.py`) to pull PyTorch/FFmpeg deps
+* **10-bit HDR video path** with HEVC/NVENC/libx265 support
+* Single-file **bootstrapper** (`setup_env.py`) to install PyTorch/FFmpeg-related dependencies
 
 
 
@@ -40,7 +41,7 @@ Huge thanks to **Fortuna** (author of nodes/docs) and the ComfyUI community.
 
 3. **Create & activate venv**
 
-Creation venv
+Create venv
 ```bash
 python -m venv venv
 ```
@@ -85,6 +86,12 @@ python main.py -i input.mp4 -o output_sbs.mp4 --preset balance
 python main.py -i ./frames -o ./out --input-type folder --preset balance
 ```
 
+For repeated folder benchmarks/tests, existing PNG outputs can be removed automatically:
+
+```bash
+python main.py -i ./frames -o ./out --input-type folder --preset balance --clean-output-pngs
+```
+
 ### Single image (i2i)
 
 One image
@@ -105,9 +112,12 @@ python main.py -i input.mp4 -o output_sbs.mp4 --preset balance --debug
 
 
 
+
 ## ⚡ Performance Presets (Full HD, Depth-Anything-V2)
 Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR5**  
-*(Windows 10, CUDA 12, Python 3.12)*  
+*(Windows 11, CUDA 13, Python 3.12)*
+
+*AMP autocast: **bfloat16***
 
 > **Note:**
 > 
@@ -120,19 +130,18 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 
 ###  Presets - Folder Mode (Full HD)
 
-| Preset | Target VRAM | Model | Batch | Feeders | Preprocess | Processors | Savers | Queues (r/in/p/s) | RAM Usage (avg/max GB) | FPS | Notes |
+| Preset | Typical VRAM Usage | Model | Batch | Feeders | Preprocess | Processors | Savers | Queues (r/in/p/s) | RAM Usage (avg/max GB) | FPS | Notes |
 |:-------|:-------------|:-------|:-------|:---------|:------------|:------------|:--------|:------------------|:------------------------|:------|:------|
-| **Minimum** | 4 GB | Depth-Anything-V2-Small-hf | 4 | 1 | 1 | 4 | 3 | 8 | 4,3 / 4,8 | **21.9 FPS** | Optimized for low-VRAM/RAM system |
-| **Balance** | 8 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 4 | 16 | 7,0 / 7,7 | **22.2 FPS** | Best overall performance |
-| **Max Quality** | 12 GB | Depth-Anything-V2-Large-hf | 6 | 1 | 2 | 4 | 2 | 16 | 5,0/ 5,8 | **16.7 FPS** | Highest depth accuracy, GPU-bound |
+| **Minimum** | 2.2 GB | Depth-Anything-V2-Small-hf | 4 | 1 | 1 | 4 | 4 | 8 | 3.4 / 3.6 | **36.5 FPS** | Optimized for low-VRAM/RAM system |
+| **Balance** | 4.5 GB | Depth-Anything-V2-Base-hf | 5 | 2 | 3 | 8 | 5 | 16 | 6.4 / 7.1 | **40.7 FPS** | Best overall performance |
+| **Max Quality** | 11.7 GB | Depth-Anything-V2-Large-hf | 8 | 2 | 2 | 8 | 5 | 16 | 5.7 / 6.5 | **40.0 FPS** | Highest depth accuracy, GPU-bound |
 
-###  Presets - Video Mode (Full HD) 
+###  Presets - Video Mode (Full HD)
 | Preset | Typical VRAM Usage | Model | Batch | Feeders | Preprocess | Processors | Savers | Queues (r/in/p/s) | RAM Usage (avg/max GB) | FPS | Notes |
 |:-------|:-------------|:-------|:-------|:---------|:------------|:------------|:--------|:------------------|:------------------------|:------|:------|
 | **Minimum** | 2.4 GB | Depth-Anything-V2-Small-hf | 3 | 1 | 1 | 4 | 1 | 6 | 3.5 / 3.8 | **36.7 FPS** | Optimized for low-VRAM/RAM system |
-| **Balance** | 5.2 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.5 / 5.95 | **39.6 FPS** | Best overall performance |
-| **Max Quality** | 8.5 GB | Depth-Anything-V2-Large-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.3 / 5.7 | **36.6 FPS** | Highest depth accuracy, GPU-bound |
-
+| **Balance** | 5.2 GB | Depth-Anything-V2-Base-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.5 / 6.0 | **39.5 FPS** | Best overall performance |
+| **Max Quality** | 8.5 GB | Depth-Anything-V2-Large-hf | 5 | 1 | 2 | 8 | 1 | 16 | 5.3 / 5.7 | **37.0 FPS** | Highest depth accuracy, GPU-bound |
 
 ---
 
@@ -146,7 +155,7 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 
 - After several hours of system uptime, performance may drop by **≈25 %**, likely due to Windows scheduler or GPU driver throttling (not related to the script).  
 - To ensure consistent results, **reboot before long renders or benchmarking**.  
-- The presets above were benchmarked on **Windows 10**, so FPS values reflect typical Windows performance.
+- The presets above were benchmarked on **Windows 11**, so FPS values reflect typical Windows performance.
 
 
 ## Project structure
@@ -162,6 +171,7 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 ├─ test_cli.py           # Testing operational
 ├─ setup_env.py          # Bootstrap PyTorch/FFmpeg and requirements
 ├─ torch_detect.py       # Torch check (setup_env.py component)
+├─ hdr.py                # Isolated 10-bit HDR support
 ├─ requirements.txt
 └─ README.md
 ```
