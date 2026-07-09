@@ -10,13 +10,14 @@ from threading import Thread
 from queue import Queue, Empty, Full
 from natsort import natsorted
 from dataclasses import fields
+from pathlib import Path
 import numpy as np
 import threading
 import time , cv2 , signal 
 from depthestimator import DepthEstimator 
 from converter import ImageSBSConverter
 from pipeline_core import PipelineContext
-from sbsutils import force_exit , debug_report , load_preset , merge_with_preset , validate_config , detect_nvenc_support
+from sbsutils import force_exit , debug_report , load_preset , merge_with_preset , validate_config , detect_nvenc_support ,  clean_output_pngs
 # --- HDR (10-bit) --- isolated HDR module; imported by name to avoid clashing with the `hdr` flag.
 from hdr import select_codec
 
@@ -343,7 +344,7 @@ def run_pipeline(ctx: PipelineContext):
 # --- Command-line interface ---
 if __name__ == "__main__":
     import argparse
-    version = "1.1.5"
+    version = "1.1.6"
     parser = argparse.ArgumentParser(
         description="VR we are! CLI pipeline (video → 3D SBS video, "
                     "folder → batch of images, i2i → single/multiple images one-by-one)."
@@ -386,6 +387,8 @@ if __name__ == "__main__":
                     help="Enable debug mode with memory/queue monitoring")
     parser.add_argument("--preset","-p", type=str, choices=["minimum", "balance", "max_quality"],
                         help="Use a predefined configuration preset")
+    parser.add_argument("--clean-output-pngs", action="store_true",
+                    help="Folder mode only: delete existing PNG files in output folder before processing")
 
     # Queues
     parser.add_argument("--in-queue", type=int, default=None,
@@ -502,7 +505,14 @@ if __name__ == "__main__":
             #for k, v in merged_params.items():
             #    print(f"{k:>15}: {v}")
 
-            validate_config(merged_params, parser)
+            validate_config({**merged_params, "clean_output_pngs": args.clean_output_pngs}, parser)
+            
+            if args.clean_output_pngs:
+                clean_output_pngs(
+                    merged_params["output_path"],
+                    merged_params["video_path"]
+                )
+            
             ctx = init_pipeline(
                 version,
                 estimator=estimator,
@@ -514,6 +524,9 @@ if __name__ == "__main__":
             debug_report(ctx)
         else:
             validate_config(args, parser)
+            if args.clean_output_pngs:
+                clean_output_pngs(args.output, args.input)
+            
             ctx = init_pipeline(
                 version,
                 video_path=args.input,
