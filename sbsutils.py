@@ -40,6 +40,24 @@ def detect_nvenc_support():
             pass
 
     return success
+    
+def clean_output_pngs(output_path: str, input_path: str, parser=None):
+    """
+    Deletes only PNG files from the folder output directory.
+    Used for folder-mode benchmark/test runs.
+    """
+    out_dir = Path(output_path).resolve()
+    in_dir = Path(input_path).resolve()
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    deleted = 0
+    for p in out_dir.iterdir():
+        if p.is_file() and p.suffix.lower() == ".png":
+            p.unlink()
+            deleted += 1
+
+    print(f"[clean] Deleted {deleted} PNG files from: {out_dir}")
 
 def force_exit(sig=None, frame=None):
     try:
@@ -216,6 +234,7 @@ def validate_config(params, parser=None):
     video_quality = params.get("quality")  or params.get("video_quality")
     infer_accum_batches = params.get("infer_accum_batches")
     hdr = params.get("hdr")
+    clean_output_pngs = params.get("clean_output_pngs")
 
     def fail(msg):
         if parser:
@@ -226,6 +245,14 @@ def validate_config(params, parser=None):
     # HDR (10-bit)
     if hdr and input_type != "video":
         fail("--hdr is only supported for --input-type=video")
+        
+    # Folder output cleanup
+    if clean_output_pngs and input_type != "folder":
+        fail("--clean-output-pngs can only be used with --input-type=folder")
+
+    if clean_output_pngs and input_path and output_path:
+        if os.path.abspath(input_path) == os.path.abspath(output_path):
+            fail("--clean-output-pngs refused: input and output folders are the same")
 
     if input_type == "video":
         if input_path and not os.path.isfile(input_path):
