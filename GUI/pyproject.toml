@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vr-we-are-gui"
+version = "0.1.0"
+description = "Cross-platform GUI module for the VR We Are CLI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+pyside6 = ["PySide6-Essentials>=6.8,<7"]
+
+[project.scripts]
+vr-we-are-gui = "vr_we_are_gui.interfaces.pyside6.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vr_we_are_gui*"]

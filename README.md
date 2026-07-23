@@ -16,16 +16,13 @@ Built for batch work, tuned for GPUs, and designed with a **multi-threaded** pip
 * **10-bit HDR video path** with HEVC/NVENC/libx265 support
 * Single-file **bootstrapper** (`setup_env.py`) to install PyTorch/FFmpeg-related dependencies
 
+## GUI [beta]
 
+The optional Windows/Linux desktop interface uses the same CLI pipeline and
+keeps its command output visible during conversion. It is built with PySide6
+Essentials and remains separate from the CLI core.
 
-## 🔗 Related project (direct "relative")
-
-This CLI grew out of the ComfyUI project:
-
-* **VR we are! (ComfyUI nodes)** – stereoscopic nodes & docs
-  GitHub: [https://github.com/FortunaCournot/comfyui_stereoscopic](https://github.com/FortunaCournot/comfyui_stereoscopic)
-
-Huge thanks to **Fortuna** (author of nodes/docs) and the ComfyUI community.
+![VR We Are GUI](assets/gui-beta.png)
 
 ## Installation
 
@@ -56,24 +53,24 @@ source venv/bin/activate
 
 4. **Run the bootstrapper**
 
+Install the CLI environment:
+
 ```bash
 python setup_env.py
+```
+
+Install the CLI environment and the optional GUI:
+
+```bash
+python setup_env.py --gui
 ```
 
 This will:
 
 * install packages from `requirements.txt`,
 * detect **CUDA** and install a matching **PyTorch** wheel (falls back to CPU build),
-* check **FFmpeg** availability (prints tips if missing).
-
-To also install the optional desktop interface in the active environment:
-
-```bash
-python setup_env.py --gui
-```
-
-The GUI is installed in editable mode with PySide6 Essentials. The standard
-setup command remains CLI-only.
+* check **FFmpeg** availability (prints tips if missing),
+* install the GUI in editable mode with PySide6 Essentials when `--gui` is used.
 
 > FFmpeg must be in `PATH`.
 > Windows (Chocolatey): `choco install ffmpeg`
@@ -82,6 +79,14 @@ setup command remains CLI-only.
 
 
 ## 🚀 Quick start
+
+### GUI [beta]
+
+After installing with `--gui`, launch the desktop interface:
+
+```bash
+vr-we-are-gui
+```
 
 ### Video → SBS video
 
@@ -184,6 +189,15 @@ Benchmarks measured on **AMD Ryzen 7 7700X + NVIDIA GeForce RTX 5090 + 32 GB DDR
 ├─ requirements.txt
 └─ README.md
 ```
+
+## 🔗 Related project (direct "relative")
+
+This CLI grew out of the ComfyUI project:
+
+* **VR we are! (ComfyUI nodes)** – stereoscopic nodes & docs
+  GitHub: [https://github.com/FortunaCournot/comfyui_stereoscopic](https://github.com/FortunaCournot/comfyui_stereoscopic)
+
+Huge thanks to **Fortuna** (author of nodes/docs) and the ComfyUI community.
 
 ## Credits
 
