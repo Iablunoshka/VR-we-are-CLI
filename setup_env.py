@@ -1,9 +1,9 @@
+import argparse
+import importlib
+import os
+import shutil
 import subprocess
 import sys
-import re
-import shutil
-import os
-import importlib
 
 
 def install_torch_auto():
@@ -24,7 +24,7 @@ def install_torch_auto():
     # CPU fallback
     if not choice:
         print("Installing CPU version of PyTorch...")
-        cpu_cmd = f"{sys.executable} -m pip install torch --index-url https://download.pytorch.org/whl/cpu"
+        cpu_cmd = f'"{sys.executable}" -m pip install torch --index-url https://download.pytorch.org/whl/cpu'
 
         try:
             subprocess.check_call(cpu_cmd, shell=True)
@@ -42,7 +42,7 @@ def install_torch_auto():
         print(f"Installation failed: {e}")
         print("Falling back to CPU version...")
 
-        cpu_cmd = f"{sys.executable} -m pip install torch  --index-url https://download.pytorch.org/whl/cpu"
+        cpu_cmd = f'"{sys.executable}" -m pip install torch  --index-url https://download.pytorch.org/whl/cpu'
         subprocess.check_call(cpu_cmd, shell=True)
         return True
 
@@ -92,6 +92,14 @@ def install_requirements_and_refresh():
     Install packages from requirements.txt located in the same folder as this script
     and refresh Python's import system.
     """
+    print("Upgrading pip...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+        print("pip upgraded successfully!")
+    except subprocess.CalledProcessError as e:
+        print(f"Error upgrading pip: {e}")
+        return False
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     req_file = os.path.join(script_dir, "requirements.txt")
 
@@ -114,10 +122,52 @@ def install_requirements_and_refresh():
 
     return True
 
+
+def install_gui():
+    """
+    Install the optional GUI package and its PySide6 Essentials dependency.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    gui_dir = os.path.join(script_dir, "GUI")
+    gui_project = os.path.join(gui_dir, "pyproject.toml")
+
+    if not os.path.exists(gui_project):
+        print(f"GUI package not found in {gui_dir}")
+        return False
+
+    print(f"Installing GUI from {gui_dir} ...")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-e", f"{gui_dir}[pyside6]"]
+        )
+        print("GUI installed successfully!")
+    except subprocess.CalledProcessError as e:
+        print(f"Error installing GUI: {e}")
+        return False
+
+    importlib.invalidate_caches()
+    if hasattr(sys, 'path_importer_cache'):
+        sys.path_importer_cache.clear()
+
+    return True
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Install the VR We Are environment.")
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Install the optional PySide6 GUI in the active environment.",
+    )
+    args = parser.parse_args()
+
     install_requirements_and_refresh()
     install_torch_auto()
     test_torch()
     test_ffmpeg()
+
+    if args.gui and not install_gui():
+        print("\nSetup completed, but the GUI installation failed.")
+        raise SystemExit(1)
 
     print("\nSetup complete! You're ready to run the pipeline.")

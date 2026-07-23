@@ -66,6 +66,15 @@ This will:
 * detect **CUDA** and install a matching **PyTorch** wheel (falls back to CPU build),
 * check **FFmpeg** availability (prints tips if missing).
 
+To also install the optional desktop interface in the active environment:
+
+```bash
+python setup_env.py --gui
+```
+
+The GUI is installed in editable mode with PySide6 Essentials. The standard
+setup command remains CLI-only.
+
 > FFmpeg must be in `PATH`.
 > Windows (Chocolatey): `choco install ffmpeg`
 > Ubuntu/Debian: `sudo apt install ffmpeg`

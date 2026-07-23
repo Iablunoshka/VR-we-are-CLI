@@ -90,7 +90,7 @@ def choose_torch(sm: int):
             "version": "2.9.0+cu126",
             "index": "cu126",
             "min_sm": 50,
-            "cmd": f"{sys.executable} -m pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu126"
+            "cmd": f'"{sys.executable}" -m pip install torch==2.9.0 torchvision==0.24.0 --index-url https://download.pytorch.org/whl/cu126'
         }
 
     # Torch 2.9.0 + cu128
@@ -99,7 +99,7 @@ def choose_torch(sm: int):
             "version": "2.9.0+cu128",
             "index": "cu128",
             "min_sm": 70,
-            "cmd": f"{sys.executable} -m pip install torch==2.9.0 torchvision==0.24.0  --index-url https://download.pytorch.org/whl/cu128"
+            "cmd": f'"{sys.executable}" -m pip install torch==2.9.0 torchvision==0.24.0  --index-url https://download.pytorch.org/whl/cu128'
         }
 
     # Torch 2.9.0 + cu130
@@ -108,7 +108,7 @@ def choose_torch(sm: int):
             "version": "2.9.0+cu130",
             "index": "cu130",
             "min_sm": 75,
-            "cmd": f"{sys.executable} -m pip install torch==2.9.0 torchvision==0.24.0  --index-url https://download.pytorch.org/whl/cu130"
+            "cmd": f'"{sys.executable}" -m pip install torch==2.9.0 torchvision==0.24.0  --index-url https://download.pytorch.org/whl/cu130'
         }
 
     # If GPU too old
