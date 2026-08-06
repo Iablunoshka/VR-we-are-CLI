@@ -31,6 +31,10 @@ Essentials and remains separate from the CLI core.
 1. **Install Python 3.12**
    [https://www.python.org/downloads/](https://www.python.org/downloads/)
 
+   For the tested Windows RTX 5090/CUDA environment, including the required
+   side-by-side CUDA 12.1 runtime and pinned package versions, follow
+   [ENVIRONMENT_PY312.md](ENVIRONMENT_PY312.md).
+
 2. **Get the sources**
 
    * Clone the repo: `git clone https://github.com/Iablunoshka/VR-we-are-CLI`

@@ -15,7 +15,7 @@ import numpy as np
 import threading
 import time , cv2 , signal 
 from depthestimator import DepthEstimator 
-from converter import ImageSBSConverter
+from gpu_converter import DIBRCore, RGBSBSConverter, NV12SBSConverter
 from pipeline_core import PipelineContext
 from sbsutils import force_exit , debug_report , load_preset , merge_with_preset , validate_config , detect_nvenc_support ,  clean_output_pngs
 # --- HDR (10-bit) --- isolated HDR module; imported by name to avoid clashing with the `hdr` flag.
@@ -83,7 +83,6 @@ def init_pipeline(
     version: str,
     video_path: str,
     estimator: DepthEstimator,
-    SBSConverter: ImageSBSConverter,
     output_path: str,
     *,
     batch_size: int = 5,
@@ -183,6 +182,19 @@ def init_pipeline(
     processor = estimator.processor
     device = estimator.device
     
+    direct_nv12 = (
+        input_type == "video"
+        and not hdr
+        and codec in ("h264_nvenc", "hevc_nvenc")
+    )
+
+    core = DIBRCore(H, W, batch_size)
+
+    if direct_nv12:
+        SBSConverter = NV12SBSConverter(core)
+    else:
+        SBSConverter = RGBSBSConverter(core)
+    
     autocast = estimator.resolve_autocast_mode(autocast)
     infer_accum_batches = max(1, int(infer_accum_batches or 1)) if estimator.device.type == "cuda" else 1
 
@@ -224,6 +236,7 @@ def init_pipeline(
         video_quality=video_quality,
         autocast=autocast,
         infer_accum_batches=infer_accum_batches,
+        direct_nv12=direct_nv12,
         hdr=hdr, master_display=master_display, max_cll=max_cll  # --- HDR (10-bit) ---
     )
     
@@ -243,7 +256,7 @@ def init_pipeline(
 
     if input_type == "video":
         ctx.result_dict = {"frames": 0}
-        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(video_path, raw_q, W, H, ctx.result_dict, max_frames, ctx.hdr))]
+        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(ctx.video_path, ctx.input_queue, ctx.batch_size, ctx.result_dict, max_frames, 0))]
     elif input_type == "folder":
         ctx.result_dict = {"frames": 0} 
         chunks = np.array_split(files, n_feeders)
@@ -261,21 +274,65 @@ def init_pipeline(
     for _ in range(n_preprocess):
         ctx.pre_workers.append(Thread(target=PipelineContext.preprocess_worker,args=(raw_q, batch_size, estimator.processor, estimator.device, inp_q, ctx.hdr)))
         
-    ctx.gpu_worker = Thread(target=PipelineContext.gpu_worker_loop,args=(estimator, inp_q, proc_q, model_name, n_preprocess, H, W, n_processors,cudnn_benchmark,input_type,ctx.autocast,ctx.infer_accum_batches))
+    ctx.gpu_worker = Thread(
+    target=PipelineContext.gpu_worker_loop,
+    args=(
+        estimator, processor, SBSConverter, inp_q, proc_q,save_q,
+        model_name, n_preprocess, H, W, n_processors,
+        cudnn_benchmark, input_type, ctx.autocast,
+        ctx.infer_accum_batches, ctx.depth_scale,
+        ctx.depth_offset, ctx.switch_sides,
+        ctx.symetric, ctx.blur_radius,ctx.batch_size,fps,codec,
+    ),
+)
                             
-    for _ in range(n_processors):
-        ctx.processors.append(Thread(target=PipelineContext.process_worker, args=(proc_q, SBSConverter, save_q,input_type,ctx.depth_scale,ctx.depth_offset,ctx.switch_sides,ctx.symetric,ctx.blur_radius,ctx.hdr)))
-    
-    if input_type == "video":
-        for _ in range(n_savers):
-            ctx.savers.append(Thread(target=PipelineContext.video_worker_thread, args=(save_q, video_path, output_path, W*2, H, fps, codec,crf, cq,ctx)))
-    elif input_type == "folder":
-        for _ in range(n_savers):
-            ctx.savers.append(Thread(target=PipelineContext.save_worker_thread, args=(save_q, output_path,input_type)))
+    if direct_nv12:
+        ctx.processors = []
+        ctx.savers = [
+            Thread(
+                target=PipelineContext.nv12_encode_mux_worker_thread,
+                args=(
+                    save_q,   # ready NV12 batches
+                    proc_q,   # free NV12 buffer pool
+                    video_path,
+                    output_path,
+                    fps,
+                    codec,
+                    ctx,
+                ),
+            )
+        ]
     else:
-        ctx.savers.append(Thread(
-            target=PipelineContext.save_worker_thread,
-            args=(save_q, output_path, input_type)))
+        ctx.processors = [
+            Thread(
+                target=PipelineContext.process_worker,
+                args=(proc_q, save_q),
+            )
+            for _ in range(n_processors)
+        ]
+
+        if input_type == "video":
+            ctx.savers = [
+                Thread(
+                    target=PipelineContext.video_worker_thread,
+                    args=(save_q, video_path, output_path, W * 2, H, fps, codec, crf, cq, ctx),
+                )
+            ]
+        elif input_type == "folder":
+            ctx.savers = [
+                Thread(
+                    target=PipelineContext.save_worker_thread,
+                    args=(save_q, output_path, input_type),
+                )
+                for _ in range(n_savers)
+            ]
+        else:
+            ctx.savers = [
+                Thread(
+                    target=PipelineContext.save_worker_thread,
+                    args=(save_q, output_path, input_type),
+                )
+            ]
         
 
     # --- Optional monitoring tools for debugging ---
@@ -441,7 +498,6 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, force_exit)
     
     estimator = DepthEstimator()
-    SBSConverter = ImageSBSConverter()
     preset_data = {}
 
     # --- i2i (image-to-image) mode ---
@@ -476,7 +532,6 @@ if __name__ == "__main__":
                 version,
                 video_path=img_path,
                 estimator=estimator,
-                SBSConverter=SBSConverter,
                 output_path=out_path,
                 batch_size=1,
                 in_queue=1, r_queue=1, s_queue=1, p_queue=1,
@@ -516,11 +571,11 @@ if __name__ == "__main__":
             ctx = init_pipeline(
                 version,
                 estimator=estimator,
-                SBSConverter=SBSConverter,
                 **merged_params
             )
 
             run_pipeline(ctx)
+            estimator.print_depth_profile()
             debug_report(ctx)
         else:
             validate_config(args, parser)
@@ -531,7 +586,6 @@ if __name__ == "__main__":
                 version,
                 video_path=args.input,
                 estimator=estimator,
-                SBSConverter=SBSConverter,
                 output_path=args.output,
                 batch_size=args.batch_size or 5,
                 in_queue=args.in_queue or 16,
@@ -561,6 +615,7 @@ if __name__ == "__main__":
                 max_cll=args.max_cll
             )
             run_pipeline(ctx)
+            estimator.print_depth_profile()
             debug_report(ctx)
         
 

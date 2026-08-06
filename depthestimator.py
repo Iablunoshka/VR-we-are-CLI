@@ -22,6 +22,18 @@ class DepthEstimator:
     ]
     
     def __init__(self):
+        self.depth_profile = {
+            "model_ms": 0.0,
+            "resize_ms": 0.0,
+            "normalize_ms": 0.0,
+            "batches": 0,
+            "frames": 0,
+        }
+
+        self.depth_profile_warmup = 3
+        self.depth_profile_calls = 0
+        
+        
         self.device = torch.device("cpu")  # default CPU
         self.model_id = None
         
@@ -56,6 +68,33 @@ class DepthEstimator:
         except Exception as e:
             print("WARN CUDA not usable:", repr(e))
             return False
+            
+    def print_depth_profile(self):
+        p = self.depth_profile
+        frames = p["frames"]
+
+        if frames == 0:
+            print("\nDepth profile: no measured frames")
+            return
+
+        total_ms = p["model_ms"] + p["resize_ms"] + p["normalize_ms"]
+
+        print("\n===== Depth GPU Profile =====")
+        print(f"Warm-up batches skipped: {self.depth_profile_warmup}")
+        print(f"Measured batches:        {p['batches']}")
+        print(f"Measured frames:         {frames}")
+        print(f"Model total:             {p['model_ms']:.2f} ms")
+        print(f"Resize total:            {p['resize_ms']:.2f} ms")
+        print(f"Normalize total:         {p['normalize_ms']:.2f} ms")
+        print(f"Model/frame:             {p['model_ms'] / frames:.4f} ms")
+        print(f"Resize/frame:            {p['resize_ms'] / frames:.4f} ms")
+        print(f"Normalize/frame:         {p['normalize_ms'] / frames:.4f} ms")
+        print(f"Depth total/frame:       {total_ms / frames:.4f} ms")
+        print(f"Depth-only FPS:          {frames * 1000 / total_ms:.2f}")
+        print(f"Model share:             {p['model_ms'] / total_ms * 100:.2f}%")
+        print(f"Resize share:            {p['resize_ms'] / total_ms * 100:.2f}%")
+        print(f"Normalize share:         {p['normalize_ms'] / total_ms * 100:.2f}%")
+        print("=============================\n")
             
     def resolve_autocast_mode(self, autocast: str | None) -> str | None:
         """
@@ -123,6 +162,7 @@ class DepthEstimator:
                 self.processor = AutoImageProcessor.from_pretrained(self.model_id, use_fast=True)
             except TypeError:
                 self.processor = AutoImageProcessor.from_pretrained(self.model_id)
+                
             self.model = AutoModelForDepthEstimation.from_pretrained(self.model_id)
             
             torch.backends.cudnn.benchmark = cudnn_benchmark
@@ -131,6 +171,15 @@ class DepthEstimator:
             
             if self.device.type == "cuda":
                 self.model = (self.model.to(self.device).eval())
+                print("Compiling model with torch.compile...")
+
+                self.model = torch.compile(
+                    self.model,
+                    backend="inductor",
+                    mode="default",
+                    fullgraph=False,
+                    dynamic=False,
+                )
             else:
                 self.model.eval()
 
@@ -139,17 +188,18 @@ class DepthEstimator:
             pass
 
 
-    def predict_batch_tensor(self, pixel_values: torch.Tensor,cudnn_benchmark: bool, target_size: tuple[int, int] = None, model_name: str = None,autocast: str | None = None) -> list[np.ndarray]:
+    def predict_batch_tensor(self, pixel_values: torch.Tensor,cudnn_benchmark: bool,compiled_batch_size: int, target_size: tuple[int, int] = None, model_name: str = None,autocast: str | None = None, ) -> list[np.ndarray]:
         """
         Generate normalized depth maps for a batch.
         """
         # Make sure the model is loaded
-        if model_name is not None:
-            self.load_model(model_name,cudnn_benchmark)
-        elif self.model is None:
-            self.load_model(self.AVAILABLE_MODELS[0],cudnn_benchmark)
+        #if model_name is not None:
+        #    self.load_model(model_name,cudnn_benchmark)
+        #elif self.model is None:
+        #    self.load_model(self.AVAILABLE_MODELS[0],cudnn_benchmark)
 
         B, _, H_in, W_in = pixel_values.shape
+        profile = False
 
         # Amp autocast check
         if self.device.type == "cuda" and autocast is not None:
@@ -170,33 +220,65 @@ class DepthEstimator:
             autocast_ctx = contextlib.nullcontext()
             
         # Inference
-        with torch.no_grad():
-            with autocast_ctx:
-                outputs = self.model(pixel_values)
-                preds = outputs.predicted_depth  # [B, H_out, W_out]
+        real_batch_size = pixel_values.shape[0]
 
+        if real_batch_size < compiled_batch_size:
+            pad_count = compiled_batch_size - real_batch_size
 
-        preds = preds.unsqueeze(1).float()  # [B, 1, H_out, W_out]
+            padding = pixel_values[-1:].expand(pad_count,*pixel_values.shape[1:],)
 
-        # Size for interpolation
-        if target_size is None:
-            target_size = (H_in, W_in)
-            
-        #print(f"target_size: {target_size}")
-        # Interpolate to original size
+            pixel_values_for_model = torch.cat((pixel_values, padding),dim=0,)
+        else:
+            pixel_values_for_model = pixel_values
+
+        if profile:
+            model_start = torch.cuda.Event(enable_timing=True)
+            model_end = torch.cuda.Event(enable_timing=True)
+            resize_end = torch.cuda.Event(enable_timing=True)
+            normalize_end = torch.cuda.Event(enable_timing=True)
+
+            model_start.record()
+
+        with torch.inference_mode(), autocast_ctx:
+            preds = self.model(pixel_values_for_model).predicted_depth
+
+        if profile:
+            model_end.record()
+
+        preds = preds[:real_batch_size]
+        preds = preds.unsqueeze(1).float()
+
         preds_resized = torch.nn.functional.interpolate(
             preds,
             size=target_size,
             mode="bicubic",
-            align_corners=False
-        ).squeeze(1)  # [B, H, W] float32 normalized
+            align_corners=False,
+        ).squeeze(1)
 
-        # Normalization for each batch element
-        mins = preds_resized.amin(dim=(1,2), keepdim=True)  # [B, 1, 1]
-        maxs = preds_resized.amax(dim=(1,2), keepdim=True)  # [B, 1, 1]
-        ranges = (maxs - mins).clamp(min=1e-6)
-        normalized = (preds_resized - mins) / ranges  # [B, H, W]
-        
+        if profile:
+            resize_end.record()
+
+        mins = preds_resized.amin(dim=(1, 2), keepdim=True)
+        maxs = preds_resized.amax(dim=(1, 2), keepdim=True)
+        normalized = (preds_resized - mins) / (maxs - mins).clamp_min_(1e-6)
+
+        if profile:
+            normalize_end.record()
+            normalize_end.synchronize()
+
+            model_ms = model_start.elapsed_time(model_end)
+            resize_ms = model_end.elapsed_time(resize_end)
+            normalize_ms = resize_end.elapsed_time(normalize_end)
+
+            self.depth_profile_calls += 1
+
+            if self.depth_profile_calls > self.depth_profile_warmup:
+                self.depth_profile["model_ms"] += model_ms
+                self.depth_profile["resize_ms"] += resize_ms
+                self.depth_profile["normalize_ms"] += normalize_ms
+                self.depth_profile["batches"] += 1
+                self.depth_profile["frames"] += real_batch_size
+
         return normalized
     
     def predict_batch(self, images: list[np.ndarray],model_name,cudnn_benchmark,autocast: str | None = None) -> list[np.ndarray]:

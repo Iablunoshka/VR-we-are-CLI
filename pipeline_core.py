@@ -1,12 +1,18 @@
 from threading import Thread
 from queue import Queue,Empty
+from fractions import Fraction
 from dataclasses import dataclass, field
 import threading
 import numpy as np
-import os, time, cv2, subprocess, av, torch
-from sbsutils import force_exit , graceful_shutdown , prepare_batch
+import os
+
+
+
+import PyNvVideoCodec as nvc
+import time, cv2, subprocess, av, torch
+from sbsutils import force_exit , graceful_shutdown 
 from depthestimator import DepthEstimator
-from converter import ImageSBSConverter
+from gpu_converter import RGBSBSConverter, NV12SBSConverter, NV12CudaBatch
 # --- HDR (10-bit) --- all HDR-specific logic lives in the isolated hdr module; imported by
 # function name so it never clashes with the `hdr` boolean flag threaded through the workers.
 from hdr import depth_proxy, pixel_max, pixel_dtype, pipe_in_pix_fmt, encode_color_args, make_hdr_rgb48_decoder
@@ -31,7 +37,7 @@ class PipelineContext:
     video_path: str
     input_type: str
     estimator: DepthEstimator
-    SBSConverter: ImageSBSConverter
+    SBSConverter: RGBSBSConverter | NV12SBSConverter
     output_path: str
     batch_size: int
     in_queue: int
@@ -87,12 +93,230 @@ class PipelineContext:
     # etc
     fatal_error: bool = False
     video_quality: str = "medium"
+    direct_nv12: bool = False
 
     # --- HDR (10-bit) --- optional true-10-bit HDR output (video input only). When hdr=False the
     hdr: bool = False
     hdr_encoder: str = "auto"
     master_display: str | None = None
     max_cll: str | None = None
+    
+    @staticmethod
+    def create_nv12_encoder(width: int, height: int, fps: float, codec: str):
+        """
+        Create a GPU-input NV12 encoder using the verified PyNvVideoCodec contract.
+        """
+        codec_map = {
+            "h264_nvenc": "h264",
+            "hevc_nvenc": "hevc",
+        }
+
+        try:
+            encoder_codec = codec_map[codec]
+        except KeyError:
+            raise ValueError(f"Direct NV12 encoding does not support codec: {codec}")
+            
+        return nvc.CreateEncoder(
+            width,
+            height,
+            "NV12",
+            False,
+            gpu_id=0,
+            codec=encoder_codec,
+            fps=str(fps),
+            bf="1",
+            preset="P1",
+            rc="constqp",
+            constqp="22",
+            gop=str(round(fps * 2)),
+            idrperiod=str(round(fps * 2)),
+            repeatspspps="1",
+        )
+                
+    @staticmethod
+    def nv12_encode_mux_worker_thread(
+        ready_queue: Queue,
+        free_buffer_queue: Queue,
+        video_path: str,
+        output_path: str,
+        fps: float,
+        codec: str,
+        ctx,
+    ):
+        """
+        Encode ready CUDA NV12 batches and mux them with the original audio.
+        """
+        bitstream_format = {
+            "h264_nvenc": "h264",
+            "hevc_nvenc": "hevc",
+        }.get(codec)
+
+        if bitstream_format is None:
+            raise ValueError(f"Unsupported direct NV12 codec: {codec}")
+
+        fps_q = Fraction(str(fps)).limit_denominator(1001)
+        fps_text = f"{fps_q.numerator}/{fps_q.denominator}"
+        time_base = f"{fps_q.denominator}/{fps_q.numerator}"
+
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel", "info",
+
+            # 1) Encoded elementary video
+            "-r", fps_text,
+            "-f", bitstream_format,
+            "-i", "pipe:0",
+
+            # 2) Original audio
+            "-i", video_path,
+
+            "-map", "0:v:0",
+            "-map", "1:a:0?",
+
+            # 3) Assign timestamps without re-encoding
+            "-c:v", "copy",
+            "-bsf:v", f"setts=pts=N:dts=N:duration=1:time_base={time_base}",
+
+            "-c:a", "copy",
+            "-shortest",
+            output_path,
+        ]
+
+        encoder = PipelineContext.create_nv12_encoder(
+            width=ctx.W * 2,
+            height=ctx.H,
+            fps=fps,
+            codec=codec,
+        )
+
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        stats = {
+            "queue_wait_ms": 0.0,
+            "event_wait_ms": 0.0,
+            "encode_ms": 0.0,
+            "pipe_write_ms": 0.0,
+            "buffer_return_ms": 0.0,
+            "frames": 0,
+            "packets": 0,
+            "bytes": 0,
+            "batches": 0,
+        }
+
+        try:
+            while True:
+                t0 = time.perf_counter()
+
+                try:
+                    item = ready_queue.get()
+                except EOFError:
+                    break
+
+                stats["queue_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+
+                if item is None:
+                    break
+
+                nv12_batch, ready_event, frame_count = item
+
+                if not isinstance(nv12_batch, NV12CudaBatch):
+                    raise TypeError("ready_queue returned an invalid NV12 buffer")
+
+                try:
+                    # 1) Wait for DIBR completion
+                    t0 = time.perf_counter()
+                    ready_event.synchronize()
+                    stats["event_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+
+                    # 2) Measure Encode and pipe write separately
+                    for frame_index in range(frame_count):
+                        t0 = time.perf_counter()
+                        packets = encoder.Encode(nv12_batch.frame(frame_index))
+                        stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
+
+                        stats["frames"] += 1
+
+                        for packet in packets:
+                            data = packet["data"]
+
+                            stats["packets"] += 1
+                            stats["bytes"] += len(data)
+
+                            t0 = time.perf_counter()
+                            proc.stdin.write(data)
+                            stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
+
+                    stats["batches"] += 1
+
+                finally:
+                    t0 = time.perf_counter()
+
+                    try:
+                        free_buffer_queue.put(nv12_batch)
+                    except EOFError:
+                        pass
+
+                    stats["buffer_return_ms"] += (time.perf_counter() - t0) * 1000.0
+
+            # 4) Flush delayed encoder packets
+            t0 = time.perf_counter()
+            tail_packets = encoder.EndEncode()
+            stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
+
+            for packet in tail_packets:
+                data = packet["data"]
+                stats["packets"] += 1
+                stats["bytes"] += len(data)
+
+                t0 = time.perf_counter()
+                proc.stdin.write(data)
+                stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
+            frames = max(stats["frames"], 1)
+
+            print("\n===== NV12 Encoder Worker Profile =====")
+            print(f"Frames:              {stats['frames']}")
+            print(f"Batches:             {stats['batches']}")
+            print(f"Packets:             {stats['packets']}")
+            print(f"Encoded bytes:       {stats['bytes']}")
+            print(f"Ready queue wait:    {stats['queue_wait_ms']:.2f} ms")
+            print(f"CUDA event wait:     {stats['event_wait_ms']:.2f} ms")
+            print(f"Encode total:        {stats['encode_ms']:.2f} ms")
+            print(f"Pipe write total:    {stats['pipe_write_ms']:.2f} ms")
+            print(f"Buffer return:       {stats['buffer_return_ms']:.2f} ms")
+            print(f"Event wait/frame:    {stats['event_wait_ms'] / frames:.3f} ms")
+            print(f"Encode/frame:        {stats['encode_ms'] / frames:.3f} ms")
+            print(f"Pipe write/frame:    {stats['pipe_write_ms'] / frames:.3f} ms")
+            print("===============================\n")
+
+        except Exception as exc:
+            print(f"NV12 encode/mux worker failed - {exc}")
+            ctx.fatal_error = True
+            graceful_shutdown(ctx)
+
+        finally:
+            try:
+                del encoder
+            except Exception:
+                pass
+
+            try:
+                if proc.stdin:
+                    proc.stdin.close()
+            except Exception:
+                pass
+
+            try:
+                return_code = proc.wait()
+            except Exception:
+                proc.kill()
+                return
+
+            if return_code != 0 and not ctx.fatal_error:
+                print(f"FFmpeg mux failed with code {return_code}")
+                ctx.fatal_error = True
 
     @staticmethod
     def video_worker_thread(save_queue: Queue,video_path, output_path: str, width: int, height: int, fps: float,codec: str,crf: int, cq: int,ctx):
@@ -204,134 +428,260 @@ class PipelineContext:
                 cv2.imwrite(save_path, image_bgr)
     
     @staticmethod
-    def process_worker(process_queue: Queue, SBSConverter, save_queue: Queue,input_type,depth_scale,depth_offset,switch_sides,symetric,blur_radius,hdr=False):
-        """
-        Converts depth maps into SBS images and sends results to saving queue.
-        """
-
+    def process_worker(process_queue: Queue, save_queue: Queue):
+        """Wait for async D2H and forward completed SBS batches."""
         while True:
-            #start_wait = time.perf_counter()
             try:
                 item = process_queue.get()
             except EOFError:
                 return
-            #end_wait = time.perf_counter()
-            #print(f"Waited {end_wait - start_wait:.3f} s on queue.get()")
+
             if item is None:
                 break
 
-            if input_type == "video":
-                indices, depth_cpu, ev, indexed_images = item
-            else:  # folder + i2i
-                names, depth_cpu, ev, indexed_images = item
+            keys, sbs_cpu, event = item
+            event.synchronize()
 
-            if ev is not None:
-                ev.synchronize()
-
-            depth_maps = depth_cpu.to(torch.float32).numpy()
-
-            # Cooking batches
-            base_image, depth_image = prepare_batch(indexed_images, depth_maps)
-
-            #start_c = time.perf_counter()
-            # Call for processing
-            
-            sbs_images = SBSConverter.process(
-                base_image,
-                depth_image,
-                depth_scale,           # can be moved to the config
-                depth_offset,
-                switch_sides,
-                blur_radius,
-                symetric,
-                hdr                    # --- HDR (10-bit): run the warp in uint16 when set ---
-            )
-            
-            #end_c = time.perf_counter()
-            #print(f"Waited {end_c - start_c:.3f} s on converting")
-            #print(f"Save queue size: {save_queue.qsize()}/{save_queue.maxsize}")
-
-            if input_type == "video":
-                try:
-                    save_queue.put((indices, sbs_images))
-                except EOFError:
-                    return
-            else:
-                try:
-                    save_queue.put((names, sbs_images))
-                except EOFError:
-                    return
+            try:
+                save_queue.put((keys, sbs_cpu.numpy()))
+            except EOFError:
+                return
                 
     @staticmethod
-    def gpu_worker_loop(estimator, queue: Queue, process_queue: Queue, model_name, n_preprocess: int, H_orig,W_orig, n_processors: int, cudnn_benchmark: bool, input_type: str, autocast: str | None, infer_accum_batches: int,):
-        """
-        Runs depth inference on the GPU with buffering.
-        """
+    def gpu_worker_loop(
+        estimator,
+        processor,
+        SBSConverter,
+        queue: Queue,
+        process_queue: Queue,
+        save_queue: Queue,
+        model_name,
+        n_preprocess: int,
+        H_orig: int,
+        W_orig: int,
+        n_processors: int,
+        cudnn_benchmark: bool,
+        input_type: str,
+        autocast: str | None,
+        infer_accum_batches: int,
+        depth_scale: float,
+        depth_offset: float,
+        switch_sides: bool,
+        symetric: bool,
+        blur_radius: int,
+        compiled_batch_size: int,
+        fps: float,
+        codec: str,
+        profile_gpu: bool = True,
+    ):
+        """Run GPU preprocessing, depth inference and SBS conversion."""
 
-        copy_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
-        
+        device = torch.device("cuda")
+        direct_nv12 = input_type == "video" and isinstance(SBSConverter, NV12SBSConverter)
+        copy_stream = None if direct_nv12 else torch.cuda.Stream()
+
         done_count = 0
         pending_items = []
 
-        def flush_pending(pending_items):
-            if not pending_items:
-                return True
+        # process_queue becomes the free NV12 buffer pool in direct mode.
+        if direct_nv12:
+            buffer_count = 3
 
-            # sizes of original mini-batches
-            chunk_sizes = [item[2].shape[0] for item in pending_items]
+            if process_queue.maxsize and process_queue.maxsize < buffer_count:
+                raise ValueError("process_queue capacity must be at least 3 for direct NV12")
 
-            # glue all the items into one big batch.
-            merged_pixel_values = torch.cat([item[2] for item in pending_items],dim=0)
-
-            # inference
-            depth_tensor = estimator.predict_batch_tensor(
-                merged_pixel_values,
-                cudnn_benchmark,
-                target_size=(H_orig, W_orig),
-                model_name=model_name,
-                autocast=autocast,
-            )
-
-            # D2H
-            if copy_stream is not None:
-                cpu_buf = torch.empty(
-                    depth_tensor.shape,
-                    dtype=depth_tensor.dtype,
-                    device="cpu",
-                    pin_memory=True,
+            for _ in range(buffer_count):
+                process_queue.put(
+                    NV12CudaBatch(
+                        SBSConverter.Bmax,
+                        H_orig,
+                        W_orig * 2,
+                    )
                 )
 
-                compute_stream = torch.cuda.current_stream()
+        profile = {
+            "preprocess_ms": 0.0,
+            "inference_ms": 0.0,
+            "dibr_ms": 0.0,
+            "buffer_wait_ms": 0.0,
+            "batches": 0,
+            "frames": 0,
+        }
 
-                with torch.cuda.stream(copy_stream):
-                    copy_stream.wait_stream(compute_stream)
-                    depth_tensor.record_stream(copy_stream)
-                    cpu_buf.copy_(depth_tensor, non_blocking=True)
-                    ev = torch.cuda.Event(enable_timing=False)
-                    ev.record(copy_stream)
-            else:
-                cpu_buf = depth_tensor.detach().cpu().float()
-                ev = None
+        stage_events = []
+        dibr_events = []
 
-            # cut back to the original dimensions
-            start = 0
-            for item, chunk_size in zip(pending_items, chunk_sizes):
-                indices, names, _pixel_values, indexed_images = item
-                chunk_depth = cpu_buf[start:start + chunk_size]
-                start += chunk_size
+        def send_rgb_result(keys, sbs_gpu):
+            sbs_cpu = torch.empty(
+                sbs_gpu.shape,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
 
-                if input_type == "video":
-                    payload = (indices, chunk_depth, ev, indexed_images)
-                else:
-                    payload = (names, chunk_depth, ev, indexed_images)
+            compute_stream = torch.cuda.current_stream(sbs_gpu.device)
 
-                try:
-                    process_queue.put(payload)
-                except EOFError:
-                    return False
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_stream(compute_stream)
+                sbs_gpu.record_stream(copy_stream)
+                sbs_cpu.copy_(sbs_gpu, non_blocking=True)
+
+                event = torch.cuda.Event()
+                event.record(copy_stream)
+
+            try:
+                process_queue.put((keys, sbs_cpu, event))
+            except EOFError:
+                return False
 
             return True
 
+        def acquire_nv12_buffer():
+            t0 = time.perf_counter()
+
+            try:
+                output = process_queue.get()
+            except EOFError:
+                return None
+
+            profile["buffer_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+
+            if not isinstance(output, NV12CudaBatch):
+                raise TypeError("free NV12 queue returned an invalid object")
+
+            return output
+
+        def send_nv12_result(
+            nv12_batch: NV12CudaBatch,
+            frame_count: int,
+        ) -> bool:
+            # The event is recorded after all Torch/CuPy work for this buffer.
+            ready_event = torch.cuda.Event()
+            ready_event.record(torch.cuda.current_stream(device))
+
+            try:
+                save_queue.put((nv12_batch, ready_event, frame_count))
+            except EOFError:
+                return False
+
+            return True
+
+        def flush_pending():
+            if not pending_items:
+                return True
+
+            chunk_sizes = [item[2].shape[0] for item in pending_items]
+            batches = [item[2] for item in pending_items]
+
+            if profile_gpu:
+                pre_start = torch.cuda.Event(enable_timing=True)
+                pre_end = torch.cuda.Event(enable_timing=True)
+                infer_end = torch.cuda.Event(enable_timing=True)
+                pre_start.record()
+
+            # 1) Prepare the accumulated input batch
+            if isinstance(batches[0], torch.Tensor):
+                base_gpu = batches[0] if len(batches) == 1 else torch.cat(batches, dim=0)
+            else:
+                base_np = np.concatenate(batches, axis=0)
+
+                if base_np.dtype != np.uint8:
+                    raise TypeError("GPU preprocessing currently supports uint8 SDR only")
+
+                base_gpu = torch.from_numpy(base_np).to(device, non_blocking=True)
+
+            inputs = processor(
+                images=base_gpu,
+                return_tensors="pt",
+                device=device,
+                input_data_format="channels_last",
+            )
+
+            if profile_gpu:
+                pre_end.record()
+
+            # 2) Run depth inference
+            depth_batch = estimator.predict_batch_tensor(
+                inputs.pixel_values,
+                cudnn_benchmark,
+                compiled_batch_size * infer_accum_batches,
+                target_size=(H_orig, W_orig),
+                model_name=model_name,
+                autocast=autocast,
+            ).float()
+
+            if profile_gpu:
+                infer_end.record()
+                stage_events.append(
+                    (
+                        pre_start,
+                        pre_end,
+                        infer_end,
+                        base_gpu.shape[0],
+                    )
+                )
+
+            # 3) Convert each original chunk
+            start = 0
+
+            for item, chunk_size in zip(pending_items, chunk_sizes):
+                indices, names, _base = item
+                end = start + chunk_size
+
+                base_chunk = base_gpu[start:end]
+                depth_chunk = depth_batch[start:end]
+                start = end
+
+                nv12_output = None
+
+                if direct_nv12:
+                    nv12_output = acquire_nv12_buffer()
+
+                    if nv12_output is None:
+                        return False
+
+                    SBSConverter.set_output_buffer(nv12_output)
+
+                if profile_gpu:
+                    dibr_start = torch.cuda.Event(enable_timing=True)
+                    dibr_end = torch.cuda.Event(enable_timing=True)
+                    dibr_start.record()
+
+                sbs_result = SBSConverter.process(
+                    base_chunk,
+                    depth_chunk,
+                    depth_scale,
+                    depth_offset,
+                    switch_sides,
+                    blur_radius,
+                    symetric,
+                )
+
+                if profile_gpu:
+                    dibr_end.record()
+                    dibr_events.append((dibr_start, dibr_end, chunk_size))
+
+                if direct_nv12:
+                    if sbs_result is not nv12_output:
+                        raise RuntimeError("NV12 converter returned the wrong output buffer")
+
+                    if not send_nv12_result(sbs_result, chunk_size):
+                        return False
+                else:
+                    keys = indices if input_type == "video" else names
+
+                    if not send_rgb_result(keys, sbs_result):
+                        return False
+
+            profile["batches"] += 1
+            profile["frames"] += base_gpu.shape[0]
+
+            pending_items.clear()
+            return True
+
+        expected_done_count = 1 if input_type == "video" else n_preprocess
+
+        # 4) Consume incoming batches
         while True:
             try:
                 item = queue.get()
@@ -341,78 +691,107 @@ class PipelineContext:
             if item is None:
                 done_count += 1
 
-                # when all preprocess workers have completed 
-                # finish the rest and exit
-                if done_count == n_preprocess:
-                    if not flush_pending(pending_items):
+                if done_count == expected_done_count:
+                    if not flush_pending():
                         return
+
                     break
 
                 continue
 
             pending_items.append(item)
 
-            if len(pending_items) < infer_accum_batches:
-                continue
+            if len(pending_items) >= infer_accum_batches:
+                if not flush_pending():
+                    return
 
-            if not flush_pending(pending_items):
-                return
+        # 5) Collect profiling results
+        if profile_gpu:
+            torch.cuda.synchronize()
 
-            pending_items.clear()
+            for pre_start, pre_end, infer_end, frame_count in stage_events:
+                profile["preprocess_ms"] += pre_start.elapsed_time(pre_end)
+                profile["inference_ms"] += pre_end.elapsed_time(infer_end)
 
-        # finishing process workers
-        for _ in range(n_processors):
-            try:
-                process_queue.put(None)
-            except EOFError:
-                return
+            for dibr_start, dibr_end, frame_count in dibr_events:
+                profile["dibr_ms"] += dibr_start.elapsed_time(dibr_end)
+
+            if profile["frames"]:
+                frames = profile["frames"]
+
+                print("\n===== GPU Stage Profile =====")
+                print(f"Frames:              {frames}")
+                print(f"GPU batches:         {profile['batches']}")
+                print(f"Preprocess total:    {profile['preprocess_ms']:.2f} ms")
+                print(f"Inference total:     {profile['inference_ms']:.2f} ms")
+                print(f"DIBR total:          {profile['dibr_ms']:.2f} ms")
+                print(f"NV12 buffer wait:    {profile['buffer_wait_ms']:.2f} ms")
+                print(f"Preprocess/frame:    {profile['preprocess_ms'] / frames:.3f} ms")
+                print(f"Inference/frame:     {profile['inference_ms'] / frames:.3f} ms")
+                print(f"DIBR/frame:          {profile['dibr_ms'] / frames:.3f} ms")
+                print(f"Buffer wait/frame:   {profile['buffer_wait_ms'] / frames:.3f} ms")
+
+                compute_ms = (
+                    profile["preprocess_ms"]
+                    + profile["inference_ms"]
+                    + profile["dibr_ms"]
+                )
+
+                print(f"Measured compute FPS: {frames * 1000 / compute_ms:.2f}")
+                print("=============================\n")
+
+        # Encoder worker receives its sentinel later through save_queue.
+        if not direct_nv12:
+            for _ in range(n_processors):
+                try:
+                    process_queue.put(None)
+                except EOFError:
+                    return
+                    
             
     @staticmethod
     def preprocess_worker(raw_queue: Queue, batch_size: int, processor, device, input_queue: Queue, hdr=False):
-        """
-        Loads and preprocesses frames into GPU-ready tensors (batched).
-
-        --- HDR (10-bit) --- in HDR mode the depth model is fed an 8-bit sRGB *proxy* of each frame
-        (depth_proxy/pq_to_srgb8), because a raw PQ frame looks far too dark to a model trained on
-        sRGB and the predicted depth degrades. The ORIGINAL 16-bit frames are still forwarded
-        unchanged (in `list(zip(batch_idx, batch_imgs))`) for the warp, so the output colour is HDR.
-        """
+        """Collect decoded frames into NumPy batches. GPU preprocessing is done in gpu_worker_loop."""
 
         batch_idx, batch_imgs, batch_names = [], [], []
+
+        def flush_batch():
+            if not batch_imgs:
+                return True
+
+            base_np = np.stack(batch_imgs)
+
+            try:
+                input_queue.put((list(batch_idx), list(batch_names), base_np))
+            except EOFError:
+                return False
+
+            batch_idx.clear()
+            batch_imgs.clear()
+            batch_names.clear()
+            return True
+
         while True:
-            #start_wait = time.perf_counter()
             try:
                 item = raw_queue.get()
             except EOFError:
                 return
-            #end_wait = time.perf_counter()
-            #print(f"Waited {end_wait - start_wait:.3f} s on queue.get()")
+
             if item is None:
-                if batch_imgs:
-                    # --- HDR (10-bit): feed the depth model an 8-bit sRGB proxy (no-op in SDR) ---
-                    inputs = processor(images=[depth_proxy(_im, hdr) for _im in batch_imgs], return_tensors="pt")
-                    
-                    try:
-                        input_queue.put((
-                            list(batch_idx),
-                            list(batch_names),
-                            inputs.pixel_values.to(device, non_blocking=True),
-                            list(zip(batch_idx, batch_imgs))
-                        ))
-                    except EOFError:
-                        return
-                        
-                # forward single sentinel to input_queue and exit
+                if not flush_batch():
+                    return
+
                 try:
                     input_queue.put(None)
                 except EOFError:
                     return
+
                 break
-                
-            if len(item) == 2:  # (idx, img) - for video
+
+            if len(item) == 2:
                 idx, img = item
                 name = None
-            elif len(item) == 3:  # (None, img, name) - for folder
+            elif len(item) == 3:
                 idx, img, name = item
             else:
                 raise ValueError("Unknown item format")
@@ -420,63 +799,54 @@ class PipelineContext:
             batch_idx.append(idx)
             batch_imgs.append(img)
             batch_names.append(name)
-            
+
             if len(batch_imgs) >= batch_size:
-                # --- HDR (10-bit): feed the depth model an 8-bit sRGB proxy (no-op in SDR) ---
-                inputs = processor(images=[depth_proxy(_im, hdr) for _im in batch_imgs], return_tensors="pt")
-                try:
-                    input_queue.put((
-                        list(batch_idx),
-                        list(batch_names),
-                        inputs.pixel_values.to(device, non_blocking=True),
-                        list(zip(batch_idx, batch_imgs))
-                    ))
-                except EOFError:
+                if not flush_batch():
                     return
-                    
-                batch_idx.clear(); batch_imgs.clear(); batch_names.clear()
 
 
     @staticmethod
-    def video_feeder(video_path, raw_queue,W_orig,H_orig,result_dict,max_frames: int | None = None, hdr=False):
-        """
-        Streams RGB frames from video using PyAV.
+    def video_feeder(video_path, input_queue: Queue, batch_size: int, result_dict, max_frames: int | None = None, gpu_id: int = 0):
+        """Decode video with NVDEC and send CUDA RGB batches directly to gpu_worker_loop."""
 
-        --- HDR (10-bit) --- decodes as 16-bit rgb48le (uint16) when hdr, else 8-bit rgb24 (uint8).
-        """
-        container = av.open(video_path)
-        stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
+        decoder = nvc.SimpleDecoder(
+            video_path,
+            gpu_id=gpu_id,
+            use_device_memory=True,
+            output_color_type=nvc.OutputColorType.RGB,
+        )
 
-        # --- HDR (10-bit) --- PyAV's direct rgb48le conversion uses a BT.709 matrix and corrupts
-        # BT.2020 colors; route HDR frames through a colorspace-correct libavfilter graph instead
-        # (see hdr.make_hdr_rgb48_decoder). SDR keeps the fast direct to_ndarray path below.
-        hdr_decode = make_hdr_rgb48_decoder(stream) if hdr else None
-
+        total_frames = len(decoder)
         idx = 0
-        try:
-            for frame in container.decode(stream):
-                # RGB numpy array: (H, W, 3) — uint8 (rgb24) or uint16 (rgb48le) in HDR mode
-                if hdr_decode is not None:
-                    img = hdr_decode(frame)
-                else:
-                    img = frame.to_ndarray(format=pipe_in_pix_fmt(hdr))
 
-                if img.shape[0] != H_orig or img.shape[1] != W_orig:
-                    img = img[:H_orig, :W_orig]
+        while idx < total_frames:
+            request_size = min(batch_size, total_frames - idx)
 
-                try:
-                    raw_queue.put((idx, img))
-                except EOFError:
-                    return
-
-                idx += 1
-                if max_frames is not None and idx >= max_frames:
+            if max_frames is not None:
+                request_size = min(request_size, max_frames - idx)
+                if request_size <= 0:
                     break
-        finally:
-            container.close()
+
+            frames = decoder.get_batch_frames(request_size)
+            if not frames:
+                break
+
+            base_gpu = torch.stack([torch.from_dlpack(frame) for frame in frames])
+            indices = list(range(idx, idx + len(frames)))
+
+            try:
+                input_queue.put((indices, [None] * len(indices), base_gpu))
+            except EOFError:
+                return
+
+            idx += len(frames)
 
         result_dict["frames"] = idx
+
+        try:
+            input_queue.put(None)
+        except EOFError:
+            return
         
     @staticmethod
     def image_folder_feeder(folder_path, raw_queue, file_list,result_dict=None):
