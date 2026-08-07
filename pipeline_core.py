@@ -102,7 +102,13 @@ class PipelineContext:
     max_cll: str | None = None
     
     @staticmethod
-    def create_nv12_encoder(width: int, height: int, fps: float, codec: str):
+    def create_nv12_encoder(
+        width: int,
+        height: int,
+        fps: float,
+        codec: str,
+        cuda_stream: int = 0,
+    ):
         """
         Create a GPU-input NV12 encoder using the verified PyNvVideoCodec contract.
         """
@@ -122,6 +128,7 @@ class PipelineContext:
             "NV12",
             False,
             gpu_id=0,
+            cudastream=cuda_stream,
             codec=encoder_codec,
             fps=str(fps),
             bf="1",
@@ -131,7 +138,7 @@ class PipelineContext:
             gop=str(round(fps * 2)),
             idrperiod=str(round(fps * 2)),
             repeatspspps="1",
-            split_encode_mode="NV_ENC_SPLIT_THREE_FORCED_MODE",
+            split_encode_mode="NV_ENC_SPLIT_FOUR_FORCED_MODE",
         )
                 
     @staticmethod
@@ -143,6 +150,7 @@ class PipelineContext:
         fps: float,
         codec: str,
         ctx,
+        profile_encoder: bool = True,
     ):
         """
         Encode ready CUDA NV12 batches and mux them with the original audio.
@@ -187,11 +195,16 @@ class PipelineContext:
             output_path,
         ]
 
+        # PyNvVideoCodec otherwise creates a non-blocking stream with default
+        # priority. A dedicated high-priority stream gives its D2D input copies
+        # preference when inference and DIBR are using the GPU concurrently.
+        encoder_stream = torch.cuda.Stream(device=0, priority=-1)
         encoder = PipelineContext.create_nv12_encoder(
             width=ctx.W * 2,
             height=ctx.H,
             fps=fps,
             codec=codec,
+            cuda_stream=encoder_stream.cuda_stream,
         )
 
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
@@ -209,14 +222,15 @@ class PipelineContext:
 
         try:
             while True:
-                t0 = time.perf_counter()
+                t0 = time.perf_counter() if profile_encoder else 0.0
 
                 try:
                     item = ready_queue.get()
                 except EOFError:
                     break
 
-                stats["queue_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+                if profile_encoder:
+                    stats["queue_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
                 if item is None:
                     break
@@ -228,69 +242,79 @@ class PipelineContext:
 
                 try:
                     # 1) Wait for DIBR completion
-                    t0 = time.perf_counter()
+                    t0 = time.perf_counter() if profile_encoder else 0.0
                     ready_event.synchronize()
-                    stats["event_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+                    if profile_encoder:
+                        stats["event_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
                     # 2) Measure Encode and pipe write separately
                     for frame_index in range(frame_count):
-                        t0 = time.perf_counter()
+                        t0 = time.perf_counter() if profile_encoder else 0.0
                         packets = encoder.Encode(nv12_batch.frame(frame_index))
-                        stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
-
-                        stats["frames"] += 1
+                        if profile_encoder:
+                            stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
+                            stats["frames"] += 1
 
                         for packet in packets:
                             data = packet["data"]
 
-                            stats["packets"] += 1
-                            stats["bytes"] += len(data)
+                            if profile_encoder:
+                                stats["packets"] += 1
+                                stats["bytes"] += len(data)
 
-                            t0 = time.perf_counter()
+                            t0 = time.perf_counter() if profile_encoder else 0.0
                             proc.stdin.write(data)
-                            stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
+                            if profile_encoder:
+                                stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
 
-                    stats["batches"] += 1
+                    if profile_encoder:
+                        stats["batches"] += 1
 
                 finally:
-                    t0 = time.perf_counter()
+                    t0 = time.perf_counter() if profile_encoder else 0.0
 
                     try:
                         free_buffer_queue.put(nv12_batch)
                     except EOFError:
                         pass
 
-                    stats["buffer_return_ms"] += (time.perf_counter() - t0) * 1000.0
+                    if profile_encoder:
+                        stats["buffer_return_ms"] += (time.perf_counter() - t0) * 1000.0
 
             # 4) Flush delayed encoder packets
-            t0 = time.perf_counter()
+            t0 = time.perf_counter() if profile_encoder else 0.0
             tail_packets = encoder.EndEncode()
-            stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
+            if profile_encoder:
+                stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
 
             for packet in tail_packets:
                 data = packet["data"]
-                stats["packets"] += 1
-                stats["bytes"] += len(data)
+                if profile_encoder:
+                    stats["packets"] += 1
+                    stats["bytes"] += len(data)
 
-                t0 = time.perf_counter()
+                t0 = time.perf_counter() if profile_encoder else 0.0
                 proc.stdin.write(data)
-                stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
-            frames = max(stats["frames"], 1)
+                if profile_encoder:
+                    stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
 
-            print("\n===== NV12 Encoder Worker Profile =====")
-            print(f"Frames:              {stats['frames']}")
-            print(f"Batches:             {stats['batches']}")
-            print(f"Packets:             {stats['packets']}")
-            print(f"Encoded bytes:       {stats['bytes']}")
-            print(f"Ready queue wait:    {stats['queue_wait_ms']:.2f} ms")
-            print(f"CUDA event wait:     {stats['event_wait_ms']:.2f} ms")
-            print(f"Encode total:        {stats['encode_ms']:.2f} ms")
-            print(f"Pipe write total:    {stats['pipe_write_ms']:.2f} ms")
-            print(f"Buffer return:       {stats['buffer_return_ms']:.2f} ms")
-            print(f"Event wait/frame:    {stats['event_wait_ms'] / frames:.3f} ms")
-            print(f"Encode/frame:        {stats['encode_ms'] / frames:.3f} ms")
-            print(f"Pipe write/frame:    {stats['pipe_write_ms'] / frames:.3f} ms")
-            print("===============================\n")
+            if profile_encoder:
+                frames = max(stats["frames"], 1)
+                print("\n===== NV12 Encoder Worker Profile =====")
+                print("Encoder CUDA stream: dedicated high priority (-1)")
+                print(f"Frames:              {stats['frames']}")
+                print(f"Batches:             {stats['batches']}")
+                print(f"Packets:             {stats['packets']}")
+                print(f"Encoded bytes:       {stats['bytes']}")
+                print(f"Ready queue wait:    {stats['queue_wait_ms']:.2f} ms")
+                print(f"CUDA event wait:     {stats['event_wait_ms']:.2f} ms")
+                print(f"Encode total:        {stats['encode_ms']:.2f} ms")
+                print(f"Pipe write total:    {stats['pipe_write_ms']:.2f} ms")
+                print(f"Buffer return:       {stats['buffer_return_ms']:.2f} ms")
+                print(f"Event wait/frame:    {stats['event_wait_ms'] / frames:.3f} ms")
+                print(f"Encode/frame:        {stats['encode_ms'] / frames:.3f} ms")
+                print(f"Pipe write/frame:    {stats['pipe_write_ms'] / frames:.3f} ms")
+                print("===============================\n")
 
         except Exception as exc:
             print(f"NV12 encode/mux worker failed - {exc}")
@@ -626,7 +650,8 @@ class PipelineContext:
             start = 0
 
             for item, chunk_size in zip(pending_items, chunk_sizes):
-                indices, names, _base = item
+                # Video feeder items also carry a CUDA-ready event as item[3].
+                indices, names, _base = item[:3]
                 end = start + chunk_size
 
                 base_chunk = base_gpu[start:end]
@@ -699,6 +724,16 @@ class PipelineContext:
                     break
 
                 continue
+
+            if len(item) == 4:
+                # The RGB batch is produced on the feeder's dedicated CUDA
+                # stream. Insert a device-side dependency without blocking the
+                # Python thread, then register this consumer stream with the
+                # caching allocator before the tensor can be released.
+                ready_event = item[3]
+                consumer_stream = torch.cuda.current_stream(device)
+                consumer_stream.wait_event(ready_event)
+                item[2].record_stream(consumer_stream)
 
             pending_items.append(item)
 
@@ -807,21 +842,31 @@ class PipelineContext:
 
 
     @staticmethod
-    def video_feeder(video_path, input_queue: Queue, batch_size: int, result_dict, max_frames: int | None = None, gpu_id: int = 0):
+    def video_feeder(
+        video_path,
+        input_queue: Queue,
+        batch_size: int,
+        result_dict,
+        max_frames: int | None = None,
+        gpu_id: int = 0,
+        profile_feeder: bool = False,
+    ):
         """Decode video with NVDEC and send CUDA RGB batches directly to gpu_worker_loop."""
 
         # Two batches let NVDEC work ahead while the current batch is consumed.
         # At 4K RGB and batch=19 this buffer can use up to roughly 0.9 GiB VRAM.
         decoder_buffer_size = max(batch_size * 2, batch_size)
-        init_started = time.perf_counter()
+        decode_stream = torch.cuda.Stream(device=gpu_id)
+        init_started = time.perf_counter() if profile_feeder else 0.0
         decoder = nvc.ThreadedDecoder(
             video_path,
             buffer_size=decoder_buffer_size,
             gpu_id=gpu_id,
+            cuda_stream=decode_stream.cuda_stream,
             use_device_memory=True,
             output_color_type=nvc.OutputColorType.RGB,
         )
-        init_ms = (time.perf_counter() - init_started) * 1000.0
+        init_ms = (time.perf_counter() - init_started) * 1000.0 if profile_feeder else 0.0
 
         total_frames = len(decoder)
         idx = 0
@@ -838,7 +883,8 @@ class PipelineContext:
             "buffer_size": decoder_buffer_size,
         }
         stack_events = []
-        wall_started = time.perf_counter()
+        last_ready_event = None
+        wall_started = time.perf_counter() if profile_feeder else 0.0
 
         try:
             while idx < total_frames:
@@ -849,67 +895,87 @@ class PipelineContext:
                     if request_size <= 0:
                         break
 
-                started = time.perf_counter()
+                started = time.perf_counter() if profile_feeder else 0.0
                 frames = decoder.get_batch_frames(request_size)
-                profile["fetch_ms"] += (time.perf_counter() - started) * 1000.0
+                if profile_feeder:
+                    profile["fetch_ms"] += (time.perf_counter() - started) * 1000.0
                 if not frames:
                     break
 
-                started = time.perf_counter()
-                frame_tensors = [torch.from_dlpack(frame) for frame in frames]
-                profile["dlpack_ms"] += (time.perf_counter() - started) * 1000.0
+                # Keep PyNvVideoCodec conversion, DLPack hand-off and the RGB
+                # batch copy on one dedicated stream. This permits overlap with
+                # inference/DIBR running on the GPU worker's default stream.
+                with torch.cuda.stream(decode_stream):
+                    started = time.perf_counter() if profile_feeder else 0.0
+                    frame_tensors = [torch.from_dlpack(frame) for frame in frames]
+                    if profile_feeder:
+                        profile["dlpack_ms"] += (time.perf_counter() - started) * 1000.0
 
-                stack_start = torch.cuda.Event(enable_timing=True)
-                stack_end = torch.cuda.Event(enable_timing=True)
-                stack_start.record()
-                started = time.perf_counter()
-                base_gpu = torch.stack(frame_tensors)
-                profile["stack_submit_ms"] += (time.perf_counter() - started) * 1000.0
-                stack_end.record()
-                stack_events.append((stack_start, stack_end))
+                    if profile_feeder:
+                        stack_start = torch.cuda.Event(enable_timing=True)
+                        stack_end = torch.cuda.Event(enable_timing=True)
+                        stack_start.record(decode_stream)
+
+                    started = time.perf_counter() if profile_feeder else 0.0
+                    base_gpu = torch.stack(frame_tensors)
+                    if profile_feeder:
+                        profile["stack_submit_ms"] += (time.perf_counter() - started) * 1000.0
+                        stack_end.record(decode_stream)
+
+                    ready_event = torch.cuda.Event()
+                    ready_event.record(decode_stream)
+                    last_ready_event = ready_event
+
+                if profile_feeder:
+                    stack_events.append((stack_start, stack_end))
                 indices = list(range(idx, idx + len(frames)))
 
-                started = time.perf_counter()
+                started = time.perf_counter() if profile_feeder else 0.0
                 try:
-                    input_queue.put((indices, [None] * len(indices), base_gpu))
+                    input_queue.put((indices, [None] * len(indices), base_gpu, ready_event))
                 except EOFError:
                     return
-                profile["queue_wait_ms"] += (time.perf_counter() - started) * 1000.0
+                if profile_feeder:
+                    profile["queue_wait_ms"] += (time.perf_counter() - started) * 1000.0
 
                 idx += len(frames)
-                profile["frames"] += len(frames)
-                profile["batches"] += 1
+                if profile_feeder:
+                    profile["frames"] += len(frames)
+                    profile["batches"] += 1
         finally:
-            profile["wall_ms"] = (time.perf_counter() - wall_started) * 1000.0
+            if profile_feeder:
+                profile["wall_ms"] = (time.perf_counter() - wall_started) * 1000.0
 
-            # Waiting for the final event also completes all earlier stack copies
-            # on this stream, so decoder-owned frames can be released safely.
-            if stack_events:
-                stack_events[-1][1].synchronize()
+            # Required for decoder-owned frame lifetime even when profiling is off.
+            if last_ready_event is not None:
+                last_ready_event.synchronize()
+
+            if profile_feeder:
                 for stack_start, stack_end in stack_events:
                     profile["stack_gpu_ms"] += stack_start.elapsed_time(stack_end)
 
             decoder.end()
             result_dict["frames"] = idx
-            result_dict["feeder_profile"] = dict(profile)
-
-            frames_count = max(profile["frames"], 1)
-            print("\n===== Threaded NVDEC Feeder Profile =====")
-            print(f"Frames:              {profile['frames']}")
-            print(f"Batches:             {profile['batches']}")
-            print(f"Prefetch buffer:     {profile['buffer_size']} frames")
-            print(f"Decoder init:        {profile['init_ms']:.2f} ms")
-            print(f"Batch fetch/wait:    {profile['fetch_ms']:.2f} ms")
-            print(f"DLPack wrapping:     {profile['dlpack_ms']:.2f} ms")
-            print(f"Stack CPU submit:    {profile['stack_submit_ms']:.2f} ms")
-            print(f"Stack GPU interval:  {profile['stack_gpu_ms']:.2f} ms")
-            print(f"Input queue wait:    {profile['queue_wait_ms']:.2f} ms")
-            print(f"Feeder wall time:    {profile['wall_ms']:.2f} ms")
-            print(f"Fetch/frame:         {profile['fetch_ms'] / frames_count:.3f} ms")
-            print(f"Stack GPU/frame:     {profile['stack_gpu_ms'] / frames_count:.3f} ms")
-            print(f"Queue wait/frame:    {profile['queue_wait_ms'] / frames_count:.3f} ms")
-            print(f"Feeder wall rate:    {profile['frames'] * 1000.0 / max(profile['wall_ms'], 0.001):.2f} FPS")
-            print("==========================================")
+            if profile_feeder:
+                result_dict["feeder_profile"] = dict(profile)
+                frames_count = max(profile["frames"], 1)
+                print("\n===== Threaded NVDEC Feeder Profile =====")
+                print(f"Frames:              {profile['frames']}")
+                print(f"Batches:             {profile['batches']}")
+                print(f"Prefetch buffer:     {profile['buffer_size']} frames")
+                print("Decoder CUDA stream: dedicated")
+                print(f"Decoder init:        {profile['init_ms']:.2f} ms")
+                print(f"Batch fetch/wait:    {profile['fetch_ms']:.2f} ms")
+                print(f"DLPack wrapping:     {profile['dlpack_ms']:.2f} ms")
+                print(f"Stack CPU submit:    {profile['stack_submit_ms']:.2f} ms")
+                print(f"Stack GPU interval:  {profile['stack_gpu_ms']:.2f} ms")
+                print(f"Input queue wait:    {profile['queue_wait_ms']:.2f} ms")
+                print(f"Feeder wall time:    {profile['wall_ms']:.2f} ms")
+                print(f"Fetch/frame:         {profile['fetch_ms'] / frames_count:.3f} ms")
+                print(f"Stack GPU/frame:     {profile['stack_gpu_ms'] / frames_count:.3f} ms")
+                print(f"Queue wait/frame:    {profile['queue_wait_ms'] / frames_count:.3f} ms")
+                print(f"Feeder wall rate:    {profile['frames'] * 1000.0 / max(profile['wall_ms'], 0.001):.2f} FPS")
+                print("==========================================")
 
         try:
             input_queue.put(None)

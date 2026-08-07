@@ -256,7 +256,7 @@ def init_pipeline(
 
     if input_type == "video":
         ctx.result_dict = {"frames": 0}
-        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(ctx.video_path, ctx.input_queue, ctx.batch_size, ctx.result_dict, max_frames, 0))]
+        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(ctx.video_path, ctx.input_queue, ctx.batch_size, ctx.result_dict, max_frames, 0,))]
     elif input_type == "folder":
         ctx.result_dict = {"frames": 0} 
         chunks = np.array_split(files, n_feeders)
