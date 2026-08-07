@@ -4,7 +4,6 @@ set "PROJECT_ROOT=F:\VR-we-are-CLI_GPU"
 set "PROJECT_VENV=D:\Programs\Pycharm_projects\CLI\venv"
 set "FFMPEG_BIN=C:\Users\Suprim\AppData\Local\Microsoft\WinGet\Links"
 set "CUDA_ROOT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
-set "PYNVC_CUDA_RUNTIME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin"
 set "VSDEVCMD=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\VsDevCmd.bat"
 
 if not exist "%PROJECT_VENV%\Scripts\python.exe" goto :missing_python
@@ -23,7 +22,6 @@ echo Development environment ready: %PROJECT_ROOT%
 echo Python: %PROJECT_VENV%\Scripts\python.exe
 echo FFmpeg: %FFMPEG_BIN%\ffmpeg.exe
 echo MSVC/CUDA: x64 / CUDA 13.3
-echo PyNvVideoCodec runtime: CUDA 12.1
 goto :eof
 
 :missing_python

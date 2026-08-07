@@ -131,6 +131,7 @@ class PipelineContext:
             gop=str(round(fps * 2)),
             idrperiod=str(round(fps * 2)),
             repeatspspps="1",
+            split_encode_mode="NV_ENC_SPLIT_THREE_FORCED_MODE",
         )
                 
     @staticmethod
@@ -809,39 +810,106 @@ class PipelineContext:
     def video_feeder(video_path, input_queue: Queue, batch_size: int, result_dict, max_frames: int | None = None, gpu_id: int = 0):
         """Decode video with NVDEC and send CUDA RGB batches directly to gpu_worker_loop."""
 
-        decoder = nvc.SimpleDecoder(
+        # Two batches let NVDEC work ahead while the current batch is consumed.
+        # At 4K RGB and batch=19 this buffer can use up to roughly 0.9 GiB VRAM.
+        decoder_buffer_size = max(batch_size * 2, batch_size)
+        init_started = time.perf_counter()
+        decoder = nvc.ThreadedDecoder(
             video_path,
+            buffer_size=decoder_buffer_size,
             gpu_id=gpu_id,
             use_device_memory=True,
             output_color_type=nvc.OutputColorType.RGB,
         )
+        init_ms = (time.perf_counter() - init_started) * 1000.0
 
         total_frames = len(decoder)
         idx = 0
+        profile = {
+            "frames": 0,
+            "batches": 0,
+            "init_ms": init_ms,
+            "fetch_ms": 0.0,
+            "dlpack_ms": 0.0,
+            "stack_submit_ms": 0.0,
+            "stack_gpu_ms": 0.0,
+            "queue_wait_ms": 0.0,
+            "wall_ms": 0.0,
+            "buffer_size": decoder_buffer_size,
+        }
+        stack_events = []
+        wall_started = time.perf_counter()
 
-        while idx < total_frames:
-            request_size = min(batch_size, total_frames - idx)
+        try:
+            while idx < total_frames:
+                request_size = min(batch_size, total_frames - idx)
 
-            if max_frames is not None:
-                request_size = min(request_size, max_frames - idx)
-                if request_size <= 0:
+                if max_frames is not None:
+                    request_size = min(request_size, max_frames - idx)
+                    if request_size <= 0:
+                        break
+
+                started = time.perf_counter()
+                frames = decoder.get_batch_frames(request_size)
+                profile["fetch_ms"] += (time.perf_counter() - started) * 1000.0
+                if not frames:
                     break
 
-            frames = decoder.get_batch_frames(request_size)
-            if not frames:
-                break
+                started = time.perf_counter()
+                frame_tensors = [torch.from_dlpack(frame) for frame in frames]
+                profile["dlpack_ms"] += (time.perf_counter() - started) * 1000.0
 
-            base_gpu = torch.stack([torch.from_dlpack(frame) for frame in frames])
-            indices = list(range(idx, idx + len(frames)))
+                stack_start = torch.cuda.Event(enable_timing=True)
+                stack_end = torch.cuda.Event(enable_timing=True)
+                stack_start.record()
+                started = time.perf_counter()
+                base_gpu = torch.stack(frame_tensors)
+                profile["stack_submit_ms"] += (time.perf_counter() - started) * 1000.0
+                stack_end.record()
+                stack_events.append((stack_start, stack_end))
+                indices = list(range(idx, idx + len(frames)))
 
-            try:
-                input_queue.put((indices, [None] * len(indices), base_gpu))
-            except EOFError:
-                return
+                started = time.perf_counter()
+                try:
+                    input_queue.put((indices, [None] * len(indices), base_gpu))
+                except EOFError:
+                    return
+                profile["queue_wait_ms"] += (time.perf_counter() - started) * 1000.0
 
-            idx += len(frames)
+                idx += len(frames)
+                profile["frames"] += len(frames)
+                profile["batches"] += 1
+        finally:
+            profile["wall_ms"] = (time.perf_counter() - wall_started) * 1000.0
 
-        result_dict["frames"] = idx
+            # Waiting for the final event also completes all earlier stack copies
+            # on this stream, so decoder-owned frames can be released safely.
+            if stack_events:
+                stack_events[-1][1].synchronize()
+                for stack_start, stack_end in stack_events:
+                    profile["stack_gpu_ms"] += stack_start.elapsed_time(stack_end)
+
+            decoder.end()
+            result_dict["frames"] = idx
+            result_dict["feeder_profile"] = dict(profile)
+
+            frames_count = max(profile["frames"], 1)
+            print("\n===== Threaded NVDEC Feeder Profile =====")
+            print(f"Frames:              {profile['frames']}")
+            print(f"Batches:             {profile['batches']}")
+            print(f"Prefetch buffer:     {profile['buffer_size']} frames")
+            print(f"Decoder init:        {profile['init_ms']:.2f} ms")
+            print(f"Batch fetch/wait:    {profile['fetch_ms']:.2f} ms")
+            print(f"DLPack wrapping:     {profile['dlpack_ms']:.2f} ms")
+            print(f"Stack CPU submit:    {profile['stack_submit_ms']:.2f} ms")
+            print(f"Stack GPU interval:  {profile['stack_gpu_ms']:.2f} ms")
+            print(f"Input queue wait:    {profile['queue_wait_ms']:.2f} ms")
+            print(f"Feeder wall time:    {profile['wall_ms']:.2f} ms")
+            print(f"Fetch/frame:         {profile['fetch_ms'] / frames_count:.3f} ms")
+            print(f"Stack GPU/frame:     {profile['stack_gpu_ms'] / frames_count:.3f} ms")
+            print(f"Queue wait/frame:    {profile['queue_wait_ms'] / frames_count:.3f} ms")
+            print(f"Feeder wall rate:    {profile['frames'] * 1000.0 / max(profile['wall_ms'], 0.001):.2f} FPS")
+            print("==========================================")
 
         try:
             input_queue.put(None)
