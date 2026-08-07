@@ -102,13 +102,7 @@ class PipelineContext:
     max_cll: str | None = None
     
     @staticmethod
-    def create_nv12_encoder(
-        width: int,
-        height: int,
-        fps: float,
-        codec: str,
-        cuda_stream: int = 0,
-    ):
+    def create_nv12_encoder(width: int, height: int, fps: float, codec: str):
         """
         Create a GPU-input NV12 encoder using the verified PyNvVideoCodec contract.
         """
@@ -128,7 +122,6 @@ class PipelineContext:
             "NV12",
             False,
             gpu_id=0,
-            cudastream=cuda_stream,
             codec=encoder_codec,
             fps=str(fps),
             bf="1",
@@ -195,17 +188,15 @@ class PipelineContext:
             output_path,
         ]
 
-        # PyNvVideoCodec otherwise creates a non-blocking stream with default
-        # priority. A dedicated high-priority stream gives its D2D input copies
-        # preference when inference and DIBR are using the GPU concurrently.
-        encoder_stream = torch.cuda.Stream(device=0, priority=-1)
         encoder = PipelineContext.create_nv12_encoder(
             width=ctx.W * 2,
             height=ctx.H,
             fps=fps,
             codec=codec,
-            cuda_stream=encoder_stream.cuda_stream,
         )
+
+        if profile_encoder and hasattr(encoder, "EnableProfiling"):
+            encoder.EnableProfiling(True)
 
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
         stats = {
@@ -300,8 +291,12 @@ class PipelineContext:
 
             if profile_encoder:
                 frames = max(stats["frames"], 1)
+                internal_stats = (
+                    encoder.GetProfilingStats()
+                    if hasattr(encoder, "GetProfilingStats")
+                    else None
+                )
                 print("\n===== NV12 Encoder Worker Profile =====")
-                print("Encoder CUDA stream: dedicated high priority (-1)")
                 print(f"Frames:              {stats['frames']}")
                 print(f"Batches:             {stats['batches']}")
                 print(f"Packets:             {stats['packets']}")
@@ -314,6 +309,18 @@ class PipelineContext:
                 print(f"Event wait/frame:    {stats['event_wait_ms'] / frames:.3f} ms")
                 print(f"Encode/frame:        {stats['encode_ms'] / frames:.3f} ms")
                 print(f"Pipe write/frame:    {stats['pipe_write_ms'] / frames:.3f} ms")
+
+                if internal_stats is not None:
+                    internal_frames = max(int(internal_stats["frames"]), 1)
+                    print("--- PyNvVideoCodec Encode internals ---")
+                    print(f"Input submit CPU:    {internal_stats['input_cpu_ms']:.2f} ms")
+                    print(f"Input copy GPU:      {internal_stats['input_copy_gpu_ms']:.2f} ms")
+                    print(f"EncodeFrame CPU:     {internal_stats['encode_frame_cpu_ms']:.2f} ms")
+                    print(f"Packet packing CPU:  {internal_stats['packet_pack_cpu_ms']:.2f} ms")
+                    print(f"Input CPU/frame:     {internal_stats['input_cpu_ms'] / internal_frames:.3f} ms")
+                    print(f"Copy GPU/frame:      {internal_stats['input_copy_gpu_ms'] / internal_frames:.3f} ms")
+                    print(f"EncodeFrame/frame:   {internal_stats['encode_frame_cpu_ms'] / internal_frames:.3f} ms")
+                    print(f"Packet pack/frame:   {internal_stats['packet_pack_cpu_ms'] / internal_frames:.3f} ms")
                 print("===============================\n")
 
         except Exception as exc:
