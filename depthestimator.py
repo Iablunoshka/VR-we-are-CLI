@@ -74,7 +74,7 @@ class DepthEstimator:
         frames = p["frames"]
 
         if frames == 0:
-            print("\nDepth profile: no measured frames")
+            #print("\nDepth profile: no measured frames")
             return
 
         total_ms = p["model_ms"] + p["resize_ms"] + p["normalize_ms"]
@@ -159,7 +159,7 @@ class DepthEstimator:
             print(f"Loading model: {model_id}")
             self.model_id = model_id
             try:
-                self.processor = AutoImageProcessor.from_pretrained(self.model_id, use_fast=True)
+                self.processor = AutoImageProcessor.from_pretrained(self.model_id, backend="torchvision")
             except TypeError:
                 self.processor = AutoImageProcessor.from_pretrained(self.model_id)
                 
@@ -171,15 +171,18 @@ class DepthEstimator:
             
             if self.device.type == "cuda":
                 self.model = (self.model.to(self.device).eval())
-                print("Compiling model with torch.compile...")
-
-                self.model = torch.compile(
-                    self.model,
-                    backend="inductor",
-                    mode="default",
-                    fullgraph=False,
-                    dynamic=False,
-                )
+                major, minor = torch.cuda.get_device_capability(self.device)
+                if major >= 8:
+                    print("Compiling model with torch.compile...")
+                    self.model = torch.compile(
+                        self.model,
+                        backend="inductor",
+                        mode="default",
+                        fullgraph=False,
+                        dynamic=False,
+                    )
+                else:
+                    print(f"torch.compile disabled on SM {major}.{minor}; using CUDA eager mode")
             else:
                 self.model.eval()
 

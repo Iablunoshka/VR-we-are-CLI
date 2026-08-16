@@ -16,6 +16,7 @@ if errorlevel 1 exit /b %errorlevel%
 set "VIRTUAL_ENV=%PROJECT_VENV%"
 set "PATH=%PROJECT_VENV%\Scripts;%FFMPEG_BIN%;%CUDA_ROOT%\bin\x64;%CUDA_ROOT%\bin;%PYNVC_CUDA_RUNTIME%;%PATH%"
 set "PYTHONHOME="
+set "PYTHONUTF8=1"
 cd /d "%PROJECT_ROOT%"
 
 echo Development environment ready: %PROJECT_ROOT%

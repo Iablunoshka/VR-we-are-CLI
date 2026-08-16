@@ -5,6 +5,7 @@ from dataclasses import fields
 from typing import get_origin, get_args
 from types import UnionType
 
+
 def detect_nvenc_support():
     """
     Returns True if FFmpeg NVENC encoder (h264_nvenc) is both compiled AND usable.
@@ -79,7 +80,7 @@ def graceful_shutdown(ctx):
     ctx.process_queue.close()
     ctx.save_queue.close()
     
-def load_preset(mode: str, name: str, path: str = "presets.json") -> dict:
+def load_preset(mode: str, name: str, variant: str | None = None, path: str = "presets.json") -> dict:
     base_dir = Path(__file__).resolve().parent
     preset_path = Path(path)
 
@@ -96,9 +97,13 @@ def load_preset(mode: str, name: str, path: str = "presets.json") -> dict:
         raise ValueError(f"Failed to parse {preset_path.name}: {e}")
 
     try:
-        return data[mode][name]
+        presets = data[mode]
+        if variant is not None:
+            presets = presets[variant]
+        return presets[name]
     except KeyError:
-        raise ValueError(f"Preset '{name}' not found for mode '{mode}' in {preset_path}")
+        location = f"{mode}.{variant}" if variant else mode
+        raise ValueError(f"Preset '{name}' not found in '{location}' in {preset_path}")
         
 def merge_with_preset(args: argparse.Namespace, preset_data: dict, cls_type) -> dict:
     """
@@ -224,17 +229,28 @@ def validate_config(params, parser=None):
     if isinstance(params, argparse.Namespace):
         params = vars(params)
 
+    def get_value(*names):
+        for name in names:
+            value = params.get(name)
+            if value is not None:
+                return value
+        return None
+
     input_type = params.get("input_type")
-    input_path = params.get("video_path") or params.get("input")
-    output_path = params.get("output_path") or params.get("output")
-    feeders = params.get("n_feeders") or params.get("feeders")
-    savers = params.get("n_savers") or params.get("savers")
+    input_path = get_value("video_path", "input")
+    output_path = get_value("output_path", "output")
+    feeders = get_value("n_feeders", "feeders")
+    savers = get_value("n_savers", "savers")
     codec = params.get("codec")
     preset = params.get("preset")
     video_quality = params.get("quality")  or params.get("video_quality")
     infer_accum_batches = params.get("infer_accum_batches")
+    batch_size = params.get("batch_size")
     hdr = params.get("hdr")
     clean_output_pngs = params.get("clean_output_pngs")
+    frame_width = get_value("frame_width", "width")
+    frame_height = get_value("frame_height", "height")
+    direct_nv12 = params.get("direct_nv12")
 
     def fail(msg):
         if parser:
@@ -242,17 +258,52 @@ def validate_config(params, parser=None):
         else:
             raise ValueError(msg)
 
-    # HDR (10-bit)
-    if hdr and input_type != "video":
-        fail("--hdr is only supported for --input-type=video")
+    if hdr:
+        fail("--hdr is not supported by the GPU pipeline yet")
+
+    positive_integers = {
+        "--batch-size": batch_size,
+        "--in-queue": params.get("in_queue"),
+        "--r-queue": params.get("r_queue"),
+        "--s-queue": params.get("s_queue"),
+        "--p-queue": params.get("p_queue"),
+        "--preprocess": get_value("n_preprocess", "preprocess"),
+        "--processors": get_value("n_processors", "processors"),
+        "--savers": savers,
+        "--feeders": feeders,
+        "--infer-accum-batches": infer_accum_batches,
+    }
+    for name, value in positive_integers.items():
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+        ):
+            fail(f"{name} must be a positive integer")
+
+    for name in ("crop_size", "blur_radius"):
+        value = params.get(name)
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            fail(f"--{name.replace('_', '-')} must be a non-negative integer")
+
+    if input_path and output_path:
+        input_abs = os.path.normcase(os.path.realpath(os.path.abspath(input_path)))
+        output_abs = os.path.normcase(os.path.realpath(os.path.abspath(output_path)))
+        if input_abs == output_abs:
+            fail("--input and --output must be different paths")
+
+    if direct_nv12 and frame_width is not None and frame_height is not None:
+        if frame_width < 1 or frame_height < 1:
+            fail("Input frame dimensions must be positive")
+        if frame_width % 2 or frame_height % 2:
+            fail(
+                "Direct NV12 video processing requires even input width and height "
+                f"(got {frame_width}x{frame_height})"
+            )
         
     # Folder output cleanup
     if clean_output_pngs and input_type != "folder":
         fail("--clean-output-pngs can only be used with --input-type=folder")
-
-    if clean_output_pngs and input_path and output_path:
-        if os.path.abspath(input_path) == os.path.abspath(output_path):
-            fail("--clean-output-pngs refused: input and output folders are the same")
 
     if input_type == "video":
         if input_path and not os.path.isfile(input_path):
@@ -263,13 +314,6 @@ def validate_config(params, parser=None):
             fail("--feeders must be 1 when --input-type=video")
         if output_path and not output_path.lower().endswith((".mp4", ".mkv", ".avi", ".mov")):
             fail("--output must be a video file path (with extension .mp4/.mkv/...)")
-        if infer_accum_batches is not None and infer_accum_batches < 1:
-            fail("--infer-accum-batches must be >= 1")
-        # --- HDR (10-bit): 10-bit HDR needs an HEVC encoder; H.264 cannot carry it. ---
-        if hdr and codec in ("libx264", "h264_nvenc"):
-            fail("--hdr needs an HEVC encoder (libx265/hevc_nvenc); drop --codec or use --hdr-encoder.")
-
-
     elif input_type == "folder":
         if input_path and not os.path.isdir(input_path):
             fail("--input must be a directory when --input-type=folder")
@@ -282,9 +326,6 @@ def validate_config(params, parser=None):
                 fail(f"Failed to create output directory: {e}")
         if video_quality:
             fail(f"--quality is only supported for --input-type=video")
-        if infer_accum_batches is not None and infer_accum_batches < 1:
-            fail("--infer-accum-batches must be >= 1")
-
     elif input_type == "i2i":
         if input_path and os.path.isfile(input_path):
             if output_path and os.path.isdir(output_path):
@@ -361,6 +402,7 @@ def debug_report(ctx):
         print("\n--- Converter Settings ---")
         print(f"depth-scale: {ctx.depth_scale}")
         print(f"depth-offset: {ctx.depth_offset}")
+        print(f"crop-size: {ctx.crop_size}")
         print(f"switch-sides {ctx.switch_sides}")
         print(f"symmetric: {ctx.symetric}")
         print(f"blur-radius: {ctx.blur_radius}")
@@ -377,5 +419,6 @@ def debug_report(ctx):
         try:
             ctx.q_mon.plot(show=True, save_path=None)
             ctx.mem_mon.plot(show=True, save_path=None)
+            pass
         except Exception as e:
             print(f"[warn] Plot skipped: {e}")

@@ -5,6 +5,15 @@ from cupy.cuda import texture, runtime
 import torch.nn.functional as F
 
 
+def resolve_cuda_device(device=None) -> torch.device:
+    device = torch.device("cuda" if device is None else device)
+    if device.type != "cuda":
+        raise ValueError("GPU converter requires a CUDA device")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 RGB_REMAP_KERNEL_SRC = r'''
 extern "C" __global__
 void remap_tex4_u8_batch(const unsigned long long* __restrict__ tex_list,
@@ -307,17 +316,19 @@ class RemapTextureSource:
     Store shared CUDA texture resources and horizontal remap data.
     """
 
-    def __init__(self, H: int, W: int, Bmax: int):
+    def __init__(self, H: int, W: int, Bmax: int, device=None):
         self.H = int(H)
         self.W = int(W)
         self.Bmax = int(Bmax)
+        self.device = resolve_cuda_device(device)
 
         # 1) Prepare horizontal remap buffers
-        self.x = torch.arange(self.W, dtype=torch.float32, device="cuda")
+        self.x = torch.arange(self.W, dtype=torch.float32, device=self.device)
         self.targets = self.x.view(1, 1, self.W).expand(self.Bmax, self.H, self.W).contiguous()
 
         # 2) Allocate texture handles
-        self.tex_handles_gpu = cp.empty((self.Bmax,), dtype=cp.uint64)
+        with cp.cuda.Device(self.device.index):
+            self.tex_handles_gpu = cp.empty((self.Bmax,), dtype=cp.uint64)
 
         # 3) Create RGBA CUDA texture arrays
         channel_desc = texture.ChannelFormatDescriptor(8, 8, 8, 8, runtime.cudaChannelFormatKindUnsigned)
@@ -332,16 +343,18 @@ class RemapTextureSource:
         self.cu_arr_list = []
         self.tex_obj_list = []
 
-        for _ in range(self.Bmax):
-            cu_arr = texture.CUDAarray(channel_desc, self.W, self.H)
-            resource_desc = texture.ResourceDescriptor(runtime.cudaResourceTypeArray, cuArr=cu_arr)
-            tex_obj = texture.TextureObject(resource_desc, texture_desc)
+        with cp.cuda.Device(self.device.index):
+            for _ in range(self.Bmax):
+                cu_arr = texture.CUDAarray(channel_desc, self.W, self.H)
+                resource_desc = texture.ResourceDescriptor(runtime.cudaResourceTypeArray, cuArr=cu_arr)
+                tex_obj = texture.TextureObject(resource_desc, texture_desc)
 
-            self.cu_arr_list.append(cu_arr)
-            self.tex_obj_list.append(tex_obj)
+                self.cu_arr_list.append(cu_arr)
+                self.tex_obj_list.append(tex_obj)
 
         handles = np.array([self._tex_handle_u64(tex_obj) for tex_obj in self.tex_obj_list], dtype=np.uint64)
-        self.tex_handles_gpu.set(handles)
+        with cp.cuda.Device(self.device.index):
+            self.tex_handles_gpu.set(handles)
 
         self.mapx_view = None
 
@@ -406,14 +419,15 @@ class RemapTextureRGB:
     Render horizontally remapped RGB batches from CUDA textures.
     """
 
-    def __init__(self, H: int, W: int, Bmax: int = 8, block=(16, 16), debug=True):
+    def __init__(self, H: int, W: int, Bmax: int = 8, block=(16, 16), debug=True, device=None):
         self.H = int(H)
         self.W = int(W)
         self.Bmax = int(Bmax)
         self.debug = debug
+        self.device = resolve_cuda_device(device)
 
         # 1) Create shared texture source
-        self.source = RemapTextureSource(self.H, self.W, self.Bmax)
+        self.source = RemapTextureSource(self.H, self.W, self.Bmax, self.device)
 
         # 2) Configure the RGB kernel
         bx, by = int(block[0]), int(block[1])
@@ -422,7 +436,8 @@ class RemapTextureRGB:
         self.kernel = cp.RawKernel(RGB_REMAP_KERNEL_SRC, "remap_tex4_u8_batch")
 
         # 3) Allocate reusable RGB output
-        self.out_u8 = cp.empty((self.Bmax, self.H, self.W * 3), dtype=cp.uint8)
+        with cp.cuda.Device(self.device.index):
+            self.out_u8 = cp.empty((self.Bmax, self.H, self.W * 3), dtype=cp.uint8)
         
     @property
     def x(self) -> torch.Tensor:
@@ -476,16 +491,18 @@ class NV12CudaBatch:
     Store a reusable contiguous batch of encoder-compatible NV12 frames.
     """
 
-    def __init__(self, Bmax: int, H: int, W: int):
+    def __init__(self, Bmax: int, H: int, W: int, device=None):
         if H % 2 or W % 2:
             raise ValueError("NV12 width and height must be even")
 
         self.Bmax = int(Bmax)
         self.H = int(H)
         self.W = int(W)
+        self.device = resolve_cuda_device(device)
 
         # 1) Allocate contiguous NV12 storage
-        self.storage = cp.empty((self.Bmax, self.H * 3 // 2, self.W), dtype=cp.uint8)
+        with cp.cuda.Device(self.device.index):
+            self.storage = cp.empty((self.Bmax, self.H * 3 // 2, self.W), dtype=cp.uint8)
 
         # 2) Create encoder-compatible plane views
         self.y = self.storage[:, :self.H].reshape(self.Bmax, self.H, self.W, 1)
@@ -529,7 +546,20 @@ def invert_map_1d_monotonic_torch(pixel_shifts: torch.Tensor,x: torch.Tensor,tar
     du = u1 - u0
 
     xs = x0 + (targets - u0) / du
-    return torch.where(du == 0, x1, xs)
+    xs = torch.where(du == 0, x1, xs)
+
+    # No true inverse exists outside the destination interval covered by the
+    # forward map.  Reflect the missing area back into the source without
+    # touching the outermost texels: they can form a one-pixel seam at the
+    # reflection fold.  With a one-pixel guard the folds are x=1 and x=W-2.
+    edge_guard = 1
+    u_min = u_mono[..., edge_guard:edge_guard + 1]
+    u_max = u_mono[..., W - edge_guard - 1:W - edge_guard]
+
+    xs = torch.where(targets < u_min,edge_guard + (u_min - targets),xs,)
+    xs = torch.where(targets > u_max,(W - edge_guard - 1) - (targets - u_max),xs,)
+
+    return xs
     
 def prepare_remap_mapx_batch(
     pixel_shifts_in_batch: torch.Tensor,
@@ -539,10 +569,8 @@ def prepare_remap_mapx_batch(
     """
     Build a batched horizontal CUDA remap map.
     """
-    _, _, W = pixel_shifts_in_batch.shape
-
     mapx_batch = invert_map_1d_monotonic_torch(pixel_shifts_in_batch, x, targets_buffer)
-    mapx_batch.clamp_(0.0, W - 1)
+    mapx_batch.clamp_(0.0, pixel_shifts_in_batch.shape[-1] - 1)
 
     return mapx_batch
 
@@ -551,17 +579,18 @@ class RemapTextureNV12:
     Render RGB source batches directly into reusable NV12 SBS storage.
     """
 
-    def __init__(self, H: int, W: int, Bmax: int = 8, block=(16, 8)):
+    def __init__(self, H: int, W: int, Bmax: int = 8, block=(16, 8), device=None):
         self.H = int(H)
         self.W = int(W)
         self.out_W = self.W * 2
         self.Bmax = int(Bmax)
+        self.device = resolve_cuda_device(device)
 
         if self.H % 2 or self.W % 2:
             raise ValueError("NV12 rendering requires even source width and height")
 
         # 1) Create shared texture source
-        self.source = RemapTextureSource(self.H, self.W, self.Bmax)
+        self.source = RemapTextureSource(self.H, self.W, self.Bmax, self.device)
 
         # 2) Configure the 2x2 NV12 warp kernel
         bx, by = int(block[0]), int(block[1])
@@ -571,7 +600,7 @@ class RemapTextureNV12:
         self.copy_kernel = cp.RawKernel(NV12_KERNEL_SRC, "copy_half_nv12_batch")
 
         # 3) Allocate reusable encoder-compatible NV12 output
-        self.output = NV12CudaBatch(self.Bmax, self.H, self.out_W)
+        self.output = NV12CudaBatch(self.Bmax, self.H, self.out_W, self.device)
         self.batch_size = 0
 
     def build_mapx(self, pixel_shifts: torch.Tensor) -> torch.Tensor:
@@ -596,22 +625,10 @@ class RemapTextureNV12:
         Render one horizontally warped SBS half into NV12 output.
         """
 
-        # 1) Validate the active batch and destination half
-        if self.batch_size <= 0:
-            raise RuntimeError("prepare_source() must be called before render_warp_half()")
-        if dst_x not in (0, self.W):
-            raise ValueError(f"dst_x must be 0 or {self.W}")
-        if not isinstance(mapx_batch, torch.Tensor) or mapx_batch.dtype != torch.float32:
-            raise TypeError("mapx_batch must be a torch.float32 tensor")
-        if not mapx_batch.is_cuda:
-            raise ValueError("mapx_batch must be on CUDA")
-        if mapx_batch.shape != (self.batch_size, self.H, self.W):
-            raise ValueError(f"mapx_batch must have shape ({self.batch_size},{self.H},{self.W})")
-
-        # 2) Clamp crop to the local half width
+        # 1) Clamp crop to the local half width
         crop = max(-self.W, min(self.W, int(crop)))
 
-        # 3) Run the kernel in the current Torch CUDA stream
+        # 2) Run the kernel in the current Torch CUDA stream
         torch_stream = torch.cuda.current_stream(mapx_batch.device)
 
         with cp.cuda.ExternalStream(torch_stream.cuda_stream):
@@ -620,42 +637,17 @@ class RemapTextureNV12:
             gx, gy = self.grid_xy
             grid = (gx, gy, self.batch_size)
 
-            self.warp_kernel(
-                grid,
-                self.block,
-                (
-                    self.source.tex_handles_gpu,
-                    mapx_view,
-                    self.output.storage,
-                    self.batch_size,
-                    self.H,
-                    self.W,
-                    int(dst_x),
-                    crop,
-                ),
-            )
+            self.warp_kernel(grid,self.block,(self.source.tex_handles_gpu,mapx_view,self.output.storage,self.batch_size,self.H,self.W,int(dst_x),crop,),)
 
     def render_copy_half(self, base_batch: torch.Tensor, dst_x: int, crop: int = 0) -> None:
         """
         Render one unwarped SBS half directly into NV12 output.
         """
 
-        # 1) Validate input and destination
-        if self.batch_size <= 0:
-            raise RuntimeError("prepare_source() must be called before render_copy_half()")
-        if dst_x not in (0, self.W):
-            raise ValueError(f"dst_x must be 0 or {self.W}")
-        if not isinstance(base_batch, torch.Tensor) or base_batch.dtype != torch.uint8:
-            raise TypeError("base_batch must be a torch.uint8 tensor")
-        if not base_batch.is_cuda:
-            raise ValueError("base_batch must be on CUDA")
-        if base_batch.shape != (self.batch_size, self.H, self.W, 3):
-            raise ValueError(f"base_batch must have shape ({self.batch_size},{self.H},{self.W},3)")
-
-        # 2) Clamp crop to the local half width
+        # 1) Clamp crop to the local half width
         crop = max(-self.W, min(self.W, int(crop)))
 
-        # 3) Launch the copy kernel in the current Torch CUDA stream
+        # 2) Launch the copy kernel in the current Torch CUDA stream
         torch_stream = torch.cuda.current_stream(base_batch.device)
 
         with cp.cuda.ExternalStream(torch_stream.cuda_stream):
@@ -664,19 +656,7 @@ class RemapTextureNV12:
             gx, gy = self.grid_xy
             grid = (gx, gy, self.batch_size)
 
-            self.copy_kernel(
-                grid,
-                self.block,
-                (
-                    base_view,
-                    self.output.storage,
-                    self.batch_size,
-                    self.H,
-                    self.W,
-                    int(dst_x),
-                    crop,
-                ),
-            )
+            self.copy_kernel(grid,self.block,(base_view,self.output.storage,self.batch_size,self.H,self.W,int(dst_x),crop,),)
 
     def get_batch(self, batch_size: int) -> NV12CudaBatch:
         """
@@ -723,10 +703,11 @@ class DIBRCore:
     Store shared DIBR parameters and prepare depth tensors.
     """
 
-    def __init__(self, H: int, W: int, batch_size: int):
+    def __init__(self, H: int, W: int, batch_size: int, device=None):
         self.H = int(H)
         self.W = int(W)
         self.Bmax = int(batch_size)
+        self.device = resolve_cuda_device(device)
 
     def _validate_inputs(self, base_image: torch.Tensor, depth_image: torch.Tensor) -> int:
         """
@@ -741,11 +722,15 @@ class DIBRCore:
             raise ValueError("base_image and depth_image must be on CUDA")
         if base_image.device != depth_image.device:
             raise ValueError("base_image and depth_image must be on the same device")
+        if base_image.device != self.device:
+            raise ValueError(f"inputs must be on {self.device}, got {base_image.device}")
 
         if base_image.shape[1:] != (self.H, self.W, 3):
             raise ValueError(f"base_image must have shape (B,{self.H},{self.W},3)")
         if depth_image.ndim not in (3, 4):
             raise ValueError("depth_image must have shape (B,H,W) or (B,H,W,C)")
+        if depth_image.shape[1:3] != (self.H, self.W):
+            raise ValueError(f"depth_image must have spatial shape ({self.H},{self.W})")
         if depth_image.shape[0] != base_image.shape[0]:
             raise ValueError("batch sizes must match")
         if depth_image.ndim == 4 and depth_image.shape[-1] not in (1, 3):
@@ -793,8 +778,8 @@ class RGBSBSConverter:
         self.W = core.W
         self.Bmax = core.Bmax
 
-        self._remapper = RemapTextureRGB(self.H, self.W, Bmax=self.Bmax)
-        self._rgba_workspace = torch.empty((self.Bmax, self.H, self.W, 4), dtype=torch.uint8, device="cuda")
+        self._remapper = RemapTextureRGB(self.H, self.W, Bmax=self.Bmax, device=core.device)
+        self._rgba_workspace = torch.empty((self.Bmax, self.H, self.W, 4), dtype=torch.uint8, device=core.device)
         self._rgba_workspace[..., 3].fill_(255)
 
         self._warmup_remapper()
@@ -803,7 +788,7 @@ class RGBSBSConverter:
         """
         Initialize CUDA texture resources before the first real batch.
         """
-        device = torch.device("cuda")
+        device = self.core.device
         dummy_rgba = torch.zeros((1, self.H, self.W, 4), dtype=torch.uint8, device=device)
         dummy_mapx = torch.arange(self.W, dtype=torch.float32, device=device).view(1, 1, self.W).expand(1, self.H, self.W)
         torch_stream = torch.cuda.current_stream(device).cuda_stream
@@ -812,7 +797,7 @@ class RGBSBSConverter:
             self._remapper.prepare_batch(dummy_rgba, dummy_mapx)
             self._remapper.run_batch(1)
 
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
     def _crop_blackout_and_swap(
         self,
@@ -852,6 +837,7 @@ class RGBSBSConverter:
         depth_image: torch.Tensor,
         depth_scale: float,
         depth_offset: float,
+        crop_size: int,
         switch_sides: bool,
         blur_radius: int,
         symetric: bool,
@@ -871,7 +857,7 @@ class RGBSBSConverter:
         # 2) Prepare depth maps
         depth_batch = self.core._prepare_depth_batch(depth_image, invert_depth)
 
-        # 3) Calculate shift and crop parameters
+        # 3) Calculate shift parameters
         flip_offset = 0
         depth_scale_local = depth_scale * width * 50.0 / 1000000.0
         depth_offset_local = depth_offset * -8
@@ -883,13 +869,7 @@ class RGBSBSConverter:
         if invert_depth:
             depth_offset_local = -depth_offset_local
 
-        crop_size = int(depth_scale * 6) + int(depth_offset * 8)
-        crop_size2 = 0
-
-        if symetric:
-            crop_size = int(crop_size / 2)
-            crop_size2 = int(depth_scale * 6) - int(depth_offset * 8)
-            crop_size2 = int(crop_size2 / 2)
+        crop_size = max(-width, min(width, int(crop_size)))
 
         # 4) Build the main-view shift field
         pixel_shifts_main = depth_batch * depth_scale_local
@@ -918,7 +898,7 @@ class RGBSBSConverter:
             sbs_batch[:, :, symmetric_offset:symmetric_offset + width] = shifted_sym
 
         # 8) Apply crop and layout options
-        sbs_batch = self._crop_blackout_and_swap(sbs_batch, crop_size, crop_size2, symetric, switch_sides)
+        sbs_batch = self._crop_blackout_and_swap(sbs_batch, crop_size, crop_size, symetric, switch_sides)
 
         return sbs_batch
 
@@ -934,8 +914,8 @@ class NV12SBSConverter:
         self.W = core.W
         self.Bmax = core.Bmax
 
-        self._remapper = RemapTextureNV12(self.H, self.W, Bmax=self.Bmax)
-        self._rgba_workspace = torch.empty((self.Bmax, self.H, self.W, 4), dtype=torch.uint8, device="cuda")
+        self._remapper = RemapTextureNV12(self.H, self.W, Bmax=self.Bmax, device=core.device)
+        self._rgba_workspace = torch.empty((self.Bmax, self.H, self.W, 4), dtype=torch.uint8, device=core.device)
         self._rgba_workspace[..., 3].fill_(255)
         
         
@@ -945,6 +925,8 @@ class NV12SBSConverter:
 
         if actual != expected:
             raise ValueError(f"NV12 output buffer must be {expected}, got {actual}")
+        if output.device != self.core.device:
+            raise ValueError(f"NV12 output buffer must be on {self.core.device}, got {output.device}")
 
         self._remapper.output = output
 
@@ -960,6 +942,7 @@ class NV12SBSConverter:
         depth_image: torch.Tensor,
         depth_scale: float,
         depth_offset: float,
+        crop_size: int,
         switch_sides: bool,
         blur_radius: int,
         symetric: bool,
@@ -979,7 +962,7 @@ class NV12SBSConverter:
         # 2) Prepare depth maps
         depth_batch = self.core._prepare_depth_batch(depth_image, invert_depth)
 
-        # 3) Calculate shift and crop parameters
+        # 3) Calculate shift parameters
         depth_scale_local = depth_scale * width * 50.0 / 1000000.0
         depth_offset_local = depth_offset * -8
 
@@ -990,13 +973,7 @@ class NV12SBSConverter:
         if invert_depth:
             depth_offset_local = -depth_offset_local
 
-        crop_size = int(depth_scale * 6) + int(depth_offset * 8)
-        crop_size2 = 0
-
-        if symetric:
-            crop_size = int(crop_size / 2)
-            crop_size2 = int(depth_scale * 6) - int(depth_offset * 8)
-            crop_size2 = int(crop_size2 / 2)
+        crop_size = max(-width, min(width, int(crop_size)))
 
         # 4) Build the main-view remap map
         pixel_shifts_main = depth_batch * depth_scale_local
@@ -1027,7 +1004,7 @@ class NV12SBSConverter:
 
         # 9) Render the second view
         if symetric:
-            self._remapper.render_warp_half(mapx_sym, dst_x=second_offset, crop=-crop_size2)
+            self._remapper.render_warp_half(mapx_sym, dst_x=second_offset, crop=-crop_size)
         else:
             self._remapper.render_copy_half(base_image, dst_x=second_offset)
 

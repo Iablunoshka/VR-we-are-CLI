@@ -1,10 +1,6 @@
-# Tested application dependencies for Windows x64 and Python 3.12.
-#
-# PyTorch is intentionally installed separately by setup_env.py because its
-# CUDA wheel must come from the matching PyTorch index. For the current RTX
-# 5090 environment the manual command is documented in ENVIRONMENT_PY312.md.
+# Application dependencies installed after the pinned CUDA stack in setup_env.py.
 
-numpy==2.2.6
+numpy
 numba
 opencv-python
 natsort
@@ -16,12 +12,3 @@ Pillow
 transformers
 av
 nvidia-ml-py
-
-# GPU pipeline and CUDA interop.
-cupy-cuda13x==14.1.1
-pynvvideocodec==2.2.0
-triton-windows==3.5.1.post24; platform_system == "Windows"
-
-# Native NVDEC/NVENC extension development.
-pybind11==3.0.4
-

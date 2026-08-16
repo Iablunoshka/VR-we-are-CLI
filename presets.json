@@ -41,47 +41,65 @@
     }
   },
   "video": {
-    "minimum": {
-      "model_name": "depth-anything/Depth-Anything-V2-Small-hf",
-      "batch_size": 3,
-      "n_feeders": 1,
-      "n_preprocess": 1,
-      "n_processors": 4,
-      "n_savers": 1,
-      "r_queue": 6,
-      "in_queue": 6,
-      "p_queue": 6,
-      "s_queue": 6,
-      "codec": "auto",
-      "autocast": "auto"
+    "1080p": {
+      "minimum": {
+        "model_name": "depth-anything/Depth-Anything-V2-Small-hf",
+        "batch_size": 32,
+        "n_feeders": 1,
+        "n_preprocess": 1,
+        "n_processors": 1,
+        "n_savers": 1,
+        "r_queue": 4,
+        "in_queue": 4,
+        "p_queue": 4,
+        "s_queue": 4,
+        "codec": "hevc_nvenc",
+        "autocast": "auto"
+      },
+      "balance": {
+        "model_name": "depth-anything/Depth-Anything-V2-Base-hf",
+        "batch_size": 28,
+        "n_feeders": 1,
+        "n_preprocess": 1,
+        "n_processors": 1,
+        "n_savers": 1,
+        "r_queue": 4,
+        "in_queue": 4,
+        "p_queue": 4,
+        "s_queue": 4,
+        "codec": "hevc_nvenc",
+        "autocast": "auto"
+      }
     },
-    "balance": {
-      "model_name": "depth-anything/Depth-Anything-V2-Base-hf",
-      "batch_size": 5,
-      "n_feeders": 1,
-      "n_preprocess": 2,
-      "n_processors": 8,
-      "n_savers": 1,
-      "r_queue": 16,
-      "in_queue": 16,
-      "p_queue": 16,
-      "s_queue": 16,
-      "codec": "auto",
-      "autocast": "auto"
-    },
-    "max_quality": {
-      "model_name": "depth-anything/Depth-Anything-V2-Large-hf",
-      "batch_size": 5,
-      "n_feeders": 1,
-      "n_preprocess": 2,
-      "n_processors": 8,
-      "n_savers": 1,
-      "r_queue": 16,
-      "in_queue": 16,
-      "p_queue": 16,
-      "s_queue": 16,
-      "codec": "auto",
-      "autocast": "auto"
+    "high_resolution": {
+      "minimum": {
+        "model_name": "depth-anything/Depth-Anything-V2-Small-hf",
+        "batch_size": 9,
+        "n_feeders": 1,
+        "n_preprocess": 1,
+        "n_processors": 1,
+        "n_savers": 1,
+        "r_queue": 4,
+        "in_queue": 4,
+        "p_queue": 4,
+        "s_queue": 4,
+        "codec": "hevc_nvenc",
+        "autocast": "auto"
+      },
+      "balance": {
+        "model_name": "depth-anything/Depth-Anything-V2-Base-hf",
+        "batch_size": 8,
+        "n_feeders": 1,
+        "n_preprocess": 1,
+        "n_processors": 1,
+        "n_savers": 1,
+        "r_queue": 4,
+        "in_queue": 4,
+        "p_queue": 4,
+        "s_queue": 4,
+        "codec": "hevc_nvenc",
+        "autocast": "auto"
+      }
     }
   }
 }

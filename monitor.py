@@ -6,17 +6,32 @@ from queue import Queue
 import psutil
 import matplotlib.pyplot as plt
 
+try:
+    import pynvml
+except ImportError:
+    pynvml = None
+
 
 # ---------- 1) Memory Monitor: Python + Child Processes ----------
 class MemoryMonitor:
-    def __init__(self, interval: float = 0.5, include_children: bool = True):
+    def __init__(self, interval: float = 0.5, include_children: bool = True, gpu_id: int | None = None):
         self.interval = interval
         self.include_children = include_children
+        self.gpu_id = gpu_id
         self._stop_flag = threading.Event()
         self._thread = None
         self._rss_samples = []
+        self._vram_samples = []
         self._t0 = None
         self._t_samples = []
+        self._nvml_handle = None
+
+        if gpu_id is not None and pynvml is not None:
+            try:
+                pynvml.nvmlInit()
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+            except pynvml.NVMLError:
+                self._nvml_handle = None
 
     def _monitor(self):
         pid = os.getpid()
@@ -32,8 +47,10 @@ class MemoryMonitor:
                         except psutil.NoSuchProcess:
                             pass
                 self._rss_samples.append(rss)
+                if self._nvml_handle is not None:
+                    self._vram_samples.append(pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle).used)
                 self._t_samples.append(time.perf_counter() - self._t0)
-            except psutil.NoSuchProcess:
+            except (psutil.NoSuchProcess, pynvml.NVMLError if pynvml is not None else RuntimeError):
                 break
             time.sleep(self.interval)
 
@@ -50,10 +67,16 @@ class MemoryMonitor:
     def report(self):
         if not self._rss_samples:
             return None
-        return {
+        report = {
             "RSS_avg_MB": round(mean(self._rss_samples) / 1024**2),
             "RSS_max_MB": round(max(self._rss_samples) / 1024**2)
         }
+        if self._vram_samples:
+            report.update({
+                "VRAM_avg_MB": round(mean(self._vram_samples) / 1024**2),
+                "VRAM_max_MB": round(max(self._vram_samples) / 1024**2),
+            })
+        return report
 
     def plot(self, show: bool = True, save_path: str | None = None):
         if not self._rss_samples:

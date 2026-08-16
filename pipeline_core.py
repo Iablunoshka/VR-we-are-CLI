@@ -1,21 +1,16 @@
 from threading import Thread
-from queue import Queue,Empty
+from queue import Queue
 from fractions import Fraction
 from dataclasses import dataclass, field
 import threading
 import numpy as np
 import os
-
-
-
 import PyNvVideoCodec as nvc
-import time, cv2, subprocess, av, torch
-from sbsutils import force_exit , graceful_shutdown 
+import time, cv2, subprocess, torch
+from sbsutils import graceful_shutdown
 from depthestimator import DepthEstimator
 from gpu_converter import RGBSBSConverter, NV12SBSConverter, NV12CudaBatch
-# --- HDR (10-bit) --- all HDR-specific logic lives in the isolated hdr module; imported by
-# function name so it never clashes with the `hdr` boolean flag threaded through the workers.
-from hdr import depth_proxy, pixel_max, pixel_dtype, pipe_in_pix_fmt, encode_color_args, make_hdr_rgb48_decoder
+from hdr import pipe_in_pix_fmt, encode_color_args
 
 
 
@@ -53,11 +48,13 @@ class PipelineContext:
     version: str
     autocast: str | None = None
     infer_accum_batches: int | None = None
+    gpu_id: int = 0
     
     # calculated fields
     H: int = 0
     W: int = 0
     fps: float = 0.0
+    frame_count: int = 0
 
     # queues
     raw_queue: Queue = field(default=None)
@@ -75,6 +72,7 @@ class PipelineContext:
     # converter settings
     depth_scale: float = 1.0
     depth_offset: float = 0.0
+    crop_size: int = 0
     switch_sides: bool = False
     symetric: bool = False
     blur_radius: int = 19
@@ -83,6 +81,7 @@ class PipelineContext:
     # debugging/monitors
     debug: bool = False
     result_dict: dict = field(default_factory=dict)
+    result_lock: object = field(default_factory=threading.Lock)
     mem_mon: object | None = None
     q_mon: object | None = None
 
@@ -100,9 +99,18 @@ class PipelineContext:
     hdr_encoder: str = "auto"
     master_display: str | None = None
     max_cll: str | None = None
-    
+
     @staticmethod
-    def create_nv12_encoder(width: int, height: int, fps: float, codec: str):
+    def worker_entry(ctx, target, *args):
+        try:
+            target(*args)
+        except Exception as exc:
+            if not ctx.fatal_error:
+                print(f"{target.__name__} failed: {exc}")
+            graceful_shutdown(ctx)
+
+    @staticmethod
+    def create_nv12_encoder(width: int, height: int, fps: float, codec: str, gpu_id: int):
         """
         Create a GPU-input NV12 encoder using the verified PyNvVideoCodec contract.
         """
@@ -121,17 +129,18 @@ class PipelineContext:
             height,
             "NV12",
             False,
-            gpu_id=0,
+            gpu_id=gpu_id,
             codec=encoder_codec,
             fps=str(fps),
             bf="1",
             preset="P1",
             rc="constqp",
-            constqp="22",
+            constqp="21",
             gop=str(round(fps * 2)),
             idrperiod=str(round(fps * 2)),
             repeatspspps="1",
-            split_encode_mode="NV_ENC_SPLIT_FOUR_FORCED_MODE",
+            extra_output_delay="8",
+            split_encode_mode="NV_ENC_SPLIT_THREE_FORCED_MODE",
         )
                 
     @staticmethod
@@ -143,11 +152,13 @@ class PipelineContext:
         fps: float,
         codec: str,
         ctx,
-        profile_encoder: bool = True,
+        profile_gpu: bool = False
     ):
         """
         Encode ready CUDA NV12 batches and mux them with the original audio.
         """
+        profile_encoder_internal = False
+
         bitstream_format = {
             "h264_nvenc": "h264",
             "hevc_nvenc": "hevc",
@@ -159,6 +170,10 @@ class PipelineContext:
         fps_q = Fraction(str(fps)).limit_denominator(1001)
         fps_text = f"{fps_q.numerator}/{fps_q.denominator}"
         time_base = f"{fps_q.denominator}/{fps_q.numerator}"
+        duration_args = []
+        if ctx.frame_count > 0:
+            duration = Fraction(ctx.frame_count * fps_q.denominator, fps_q.numerator)
+            duration_args = ["-t", f"{float(duration):.9f}"]
 
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -179,12 +194,13 @@ class PipelineContext:
             "-map", "0:v:0",
             "-map", "1:a:0?",
 
+            # TODO: Preserve source frame PTS through NVDEC instead of forcing CFR timestamps.
             # 3) Assign timestamps without re-encoding
             "-c:v", "copy",
             "-bsf:v", f"setts=pts=N:dts=N:duration=1:time_base={time_base}",
 
             "-c:a", "copy",
-            "-shortest",
+        ] + duration_args + [
             output_path,
         ]
 
@@ -193,9 +209,10 @@ class PipelineContext:
             height=ctx.H,
             fps=fps,
             codec=codec,
+            gpu_id=ctx.gpu_id,
         )
 
-        if profile_encoder and hasattr(encoder, "EnableProfiling"):
+        if profile_gpu and profile_encoder_internal and hasattr(encoder, "EnableProfiling"):
             encoder.EnableProfiling(True)
 
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
@@ -213,14 +230,14 @@ class PipelineContext:
 
         try:
             while True:
-                t0 = time.perf_counter() if profile_encoder else 0.0
+                t0 = time.perf_counter() if profile_gpu else 0.0
 
                 try:
                     item = ready_queue.get()
                 except EOFError:
                     break
 
-                if profile_encoder:
+                if profile_gpu:
                     stats["queue_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
                 if item is None:
@@ -233,67 +250,67 @@ class PipelineContext:
 
                 try:
                     # 1) Wait for DIBR completion
-                    t0 = time.perf_counter() if profile_encoder else 0.0
+                    t0 = time.perf_counter() if profile_gpu else 0.0
                     ready_event.synchronize()
-                    if profile_encoder:
+                    if profile_gpu:
                         stats["event_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
                     # 2) Measure Encode and pipe write separately
                     for frame_index in range(frame_count):
-                        t0 = time.perf_counter() if profile_encoder else 0.0
+                        t0 = time.perf_counter() if profile_gpu else 0.0
                         packets = encoder.Encode(nv12_batch.frame(frame_index))
-                        if profile_encoder:
+                        if profile_gpu:
                             stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
                             stats["frames"] += 1
 
                         for packet in packets:
                             data = packet["data"]
 
-                            if profile_encoder:
+                            if profile_gpu:
                                 stats["packets"] += 1
                                 stats["bytes"] += len(data)
 
-                            t0 = time.perf_counter() if profile_encoder else 0.0
+                            t0 = time.perf_counter() if profile_gpu else 0.0
                             proc.stdin.write(data)
-                            if profile_encoder:
+                            if profile_gpu:
                                 stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
 
-                    if profile_encoder:
+                    if profile_gpu:
                         stats["batches"] += 1
 
                 finally:
-                    t0 = time.perf_counter() if profile_encoder else 0.0
+                    t0 = time.perf_counter() if profile_gpu else 0.0
 
                     try:
                         free_buffer_queue.put(nv12_batch)
                     except EOFError:
                         pass
 
-                    if profile_encoder:
+                    if profile_gpu:
                         stats["buffer_return_ms"] += (time.perf_counter() - t0) * 1000.0
 
             # 4) Flush delayed encoder packets
-            t0 = time.perf_counter() if profile_encoder else 0.0
+            t0 = time.perf_counter() if profile_gpu else 0.0
             tail_packets = encoder.EndEncode()
-            if profile_encoder:
+            if profile_gpu:
                 stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
 
             for packet in tail_packets:
                 data = packet["data"]
-                if profile_encoder:
+                if profile_gpu:
                     stats["packets"] += 1
                     stats["bytes"] += len(data)
 
-                t0 = time.perf_counter() if profile_encoder else 0.0
+                t0 = time.perf_counter() if profile_gpu else 0.0
                 proc.stdin.write(data)
-                if profile_encoder:
+                if profile_gpu:
                     stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
 
-            if profile_encoder:
+            if profile_gpu:
                 frames = max(stats["frames"], 1)
                 internal_stats = (
                     encoder.GetProfilingStats()
-                    if hasattr(encoder, "GetProfilingStats")
+                    if profile_encoder_internal and hasattr(encoder, "GetProfilingStats")
                     else None
                 )
                 print("\n===== NV12 Encoder Worker Profile =====")
@@ -313,13 +330,15 @@ class PipelineContext:
                 if internal_stats is not None:
                     internal_frames = max(int(internal_stats["frames"]), 1)
                     print("--- PyNvVideoCodec Encode internals ---")
+                    print(f"Input preparation:   {internal_stats['input_prep_cpu_ms']:.2f} ms")
                     print(f"Input submit CPU:    {internal_stats['input_cpu_ms']:.2f} ms")
-                    print(f"Input copy GPU:      {internal_stats['input_copy_gpu_ms']:.2f} ms")
                     print(f"EncodeFrame CPU:     {internal_stats['encode_frame_cpu_ms']:.2f} ms")
+                    print(f"GIL reacquire wait:  {internal_stats['gil_reacquire_cpu_ms']:.2f} ms")
                     print(f"Packet packing CPU:  {internal_stats['packet_pack_cpu_ms']:.2f} ms")
+                    print(f"Input prep/frame:    {internal_stats['input_prep_cpu_ms'] / internal_frames:.3f} ms")
                     print(f"Input CPU/frame:     {internal_stats['input_cpu_ms'] / internal_frames:.3f} ms")
-                    print(f"Copy GPU/frame:      {internal_stats['input_copy_gpu_ms'] / internal_frames:.3f} ms")
                     print(f"EncodeFrame/frame:   {internal_stats['encode_frame_cpu_ms'] / internal_frames:.3f} ms")
+                    print(f"GIL wait/frame:      {internal_stats['gil_reacquire_cpu_ms'] / internal_frames:.3f} ms")
                     print(f"Packet pack/frame:   {internal_stats['packet_pack_cpu_ms'] / internal_frames:.3f} ms")
                 print("===============================\n")
 
@@ -356,6 +375,12 @@ class PipelineContext:
         Writes SBS frames from queue to video via FFmpeg, preserving audio if present.
         """
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+        fps_q = Fraction(str(fps)).limit_denominator(1001)
+        duration_args = []
+        if ctx.frame_count > 0:
+            duration = Fraction(ctx.frame_count * fps_q.denominator, fps_q.numerator)
+            duration_args = ["-t", f"{float(duration):.9f}"]
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
@@ -376,10 +401,22 @@ class PipelineContext:
             ] + (["-crf", str(crf)] if codec in ("libx264", "libx265") else ["-rc:v", "vbr", "-cq:v", str(cq), "-b:v", "0"]) + [
             ] + encode_color_args(codec, ctx.hdr, ctx.master_display, ctx.max_cll) + [
             "-c:a", "copy",
+        ] + duration_args + [
             output_path
         ]
 
         proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+
+        # A single 8K SBS RGB24 frame is about 47.5 MiB.  Large writes to a
+        # Windows anonymous pipe can fail with EINVAL, so stream the exact same
+        # contiguous frame bytes in smaller pieces.  FFmpeg's rawvideo input is
+        # a byte stream; chunk boundaries do not affect frame boundaries.
+        def write_raw_frame(image):
+            contiguous = np.ascontiguousarray(image)
+            raw = memoryview(contiguous).cast("B")
+            chunk_size = 10 * 1024 * 1024
+            for offset in range(0, len(raw), chunk_size):
+                proc.stdin.write(raw[offset:offset + chunk_size])
 
         buffer = {}          # dict: index -> np.ndarray (image)
         next_index = 0       # the next frame index to be written
@@ -403,7 +440,7 @@ class PipelineContext:
                 # We try to write all available frames in a row, starting from next_index
                 while next_index in buffer:
                     try:
-                        proc.stdin.write(buffer[next_index].tobytes())
+                        write_raw_frame(buffer[next_index])
                     except Exception as e:
                         print(f"FFmpeg pipe broken - {e}")
                         ctx.fatal_error = True
@@ -457,7 +494,8 @@ class PipelineContext:
                 else:  # i2i (single image)
                     save_path = output_dir  
 
-                cv2.imwrite(save_path, image_bgr)
+                if not cv2.imwrite(save_path, image_bgr):
+                    raise OSError(f"Failed to write image: {save_path}")
     
     @staticmethod
     def process_worker(process_queue: Queue, save_queue: Queue):
@@ -478,7 +516,95 @@ class PipelineContext:
                 save_queue.put((keys, sbs_cpu.numpy()))
             except EOFError:
                 return
-                
+
+    @staticmethod
+    def _run_gpu_inference_batch(
+        batches,
+        processor,
+        estimator,
+        device,
+        cudnn_benchmark,
+        compiled_batch_size,
+        infer_accum_batches,
+        H_orig,
+        W_orig,
+        model_name,
+        autocast,
+        profile_gpu,
+    ):
+        stage_event = None
+        
+        if profile_gpu:
+            pre_start = torch.cuda.Event(enable_timing=True)
+            pre_end = torch.cuda.Event(enable_timing=True)
+            infer_end = torch.cuda.Event(enable_timing=True)
+            pre_start.record()
+
+        if isinstance(batches[0], torch.Tensor):
+            base_gpu = batches[0] if len(batches) == 1 else torch.cat(batches, dim=0)
+        else:
+            base_np = np.concatenate(batches, axis=0)
+            if base_np.dtype != np.uint8:
+                raise TypeError("GPU preprocessing currently supports uint8 SDR only")
+            base_gpu = torch.from_numpy(base_np).to(device, non_blocking=True)
+
+        inputs = processor(
+            images=base_gpu,
+            return_tensors="pt",
+            device=device,
+            input_data_format="channels_last",
+        )
+
+        if profile_gpu:
+            pre_end.record()
+
+        depth_batch = estimator.predict_batch_tensor(
+            inputs.pixel_values,
+            cudnn_benchmark,
+            compiled_batch_size * infer_accum_batches,
+            target_size=(H_orig, W_orig),
+            model_name=model_name,
+            autocast=autocast,
+        ).float()
+
+        if profile_gpu:
+            infer_end.record()
+            stage_event = (pre_start, pre_end, infer_end, base_gpu.shape[0])
+
+        return base_gpu, depth_batch, stage_event
+
+    @staticmethod
+    def _print_gpu_profile(profile, stage_events, dibr_events):
+        torch.cuda.synchronize()
+
+        for pre_start, pre_end, infer_end, _frame_count in stage_events:
+            profile["preprocess_ms"] += pre_start.elapsed_time(pre_end)
+            profile["inference_ms"] += pre_end.elapsed_time(infer_end)
+
+        for dibr_start, dibr_end, _frame_count in dibr_events:
+            profile["dibr_ms"] += dibr_start.elapsed_time(dibr_end)
+
+        if not profile["frames"]:
+            return
+
+        frames = profile["frames"]
+        print("\n===== GPU Stage Profile =====")
+        print(f"Frames:              {frames}")
+        print(f"GPU batches:         {profile['batches']}")
+        print(f"Preprocess total:    {profile['preprocess_ms']:.2f} ms")
+        print(f"Inference total:     {profile['inference_ms']:.2f} ms")
+        print(f"DIBR total:          {profile['dibr_ms']:.2f} ms")
+        print(f"NV12 buffer wait:    {profile['buffer_wait_ms']:.2f} ms")
+        print(f"Preprocess/frame:    {profile['preprocess_ms'] / frames:.3f} ms")
+        print(f"Inference/frame:     {profile['inference_ms'] / frames:.3f} ms")
+        print(f"DIBR/frame:          {profile['dibr_ms'] / frames:.3f} ms")
+        print(f"Buffer wait/frame:   {profile['buffer_wait_ms'] / frames:.3f} ms")
+
+        compute_ms = profile["preprocess_ms"] + profile["inference_ms"] + profile["dibr_ms"]
+        if compute_ms:
+            print(f"Measured compute FPS: {frames * 1000 / compute_ms:.2f}")
+        print("=============================\n")
+
     @staticmethod
     def gpu_worker_loop(
         estimator,
@@ -498,17 +624,20 @@ class PipelineContext:
         infer_accum_batches: int,
         depth_scale: float,
         depth_offset: float,
+        crop_size: int,
         switch_sides: bool,
         symetric: bool,
         blur_radius: int,
         compiled_batch_size: int,
         fps: float,
         codec: str,
-        profile_gpu: bool = True,
+        gpu_id: int,
+        profile_gpu: bool = False,
     ):
         """Run GPU preprocessing, depth inference and SBS conversion."""
 
-        device = torch.device("cuda")
+        torch.cuda.set_device(gpu_id)
+        device = torch.device("cuda", gpu_id)
         direct_nv12 = input_type == "video" and isinstance(SBSConverter, NV12SBSConverter)
         copy_stream = None if direct_nv12 else torch.cuda.Stream()
 
@@ -528,6 +657,7 @@ class PipelineContext:
                         SBSConverter.Bmax,
                         H_orig,
                         W_orig * 2,
+                        device=device,
                     )
                 )
 
@@ -569,14 +699,15 @@ class PipelineContext:
             return True
 
         def acquire_nv12_buffer():
-            t0 = time.perf_counter()
+            t0 = time.perf_counter() if profile_gpu else 0.0
 
             try:
                 output = process_queue.get()
             except EOFError:
                 return None
 
-            profile["buffer_wait_ms"] += (time.perf_counter() - t0) * 1000.0
+            if profile_gpu:
+                profile["buffer_wait_ms"] += (time.perf_counter() - t0) * 1000.0
 
             if not isinstance(output, NV12CudaBatch):
                 raise TypeError("free NV12 queue returned an invalid object")
@@ -605,55 +736,23 @@ class PipelineContext:
             chunk_sizes = [item[2].shape[0] for item in pending_items]
             batches = [item[2] for item in pending_items]
 
-            if profile_gpu:
-                pre_start = torch.cuda.Event(enable_timing=True)
-                pre_end = torch.cuda.Event(enable_timing=True)
-                infer_end = torch.cuda.Event(enable_timing=True)
-                pre_start.record()
-
-            # 1) Prepare the accumulated input batch
-            if isinstance(batches[0], torch.Tensor):
-                base_gpu = batches[0] if len(batches) == 1 else torch.cat(batches, dim=0)
-            else:
-                base_np = np.concatenate(batches, axis=0)
-
-                if base_np.dtype != np.uint8:
-                    raise TypeError("GPU preprocessing currently supports uint8 SDR only")
-
-                base_gpu = torch.from_numpy(base_np).to(device, non_blocking=True)
-
-            inputs = processor(
-                images=base_gpu,
-                return_tensors="pt",
-                device=device,
-                input_data_format="channels_last",
-            )
-
-            if profile_gpu:
-                pre_end.record()
-
-            # 2) Run depth inference
-            depth_batch = estimator.predict_batch_tensor(
-                inputs.pixel_values,
+            base_gpu, depth_batch, stage_event = PipelineContext._run_gpu_inference_batch(
+                batches,
+                processor,
+                estimator,
+                device,
                 cudnn_benchmark,
-                compiled_batch_size * infer_accum_batches,
-                target_size=(H_orig, W_orig),
-                model_name=model_name,
-                autocast=autocast,
-            ).float()
+                compiled_batch_size,
+                infer_accum_batches,
+                H_orig,
+                W_orig,
+                model_name,
+                autocast,
+                profile_gpu,
+            )
+            if stage_event is not None:
+                stage_events.append(stage_event)
 
-            if profile_gpu:
-                infer_end.record()
-                stage_events.append(
-                    (
-                        pre_start,
-                        pre_end,
-                        infer_end,
-                        base_gpu.shape[0],
-                    )
-                )
-
-            # 3) Convert each original chunk
             start = 0
 
             for item, chunk_size in zip(pending_items, chunk_sizes):
@@ -685,6 +784,7 @@ class PipelineContext:
                     depth_chunk,
                     depth_scale,
                     depth_offset,
+                    crop_size,
                     switch_sides,
                     blur_radius,
                     symetric,
@@ -706,15 +806,16 @@ class PipelineContext:
                     if not send_rgb_result(keys, sbs_result):
                         return False
 
-            profile["batches"] += 1
-            profile["frames"] += base_gpu.shape[0]
+            if profile_gpu:
+                profile["batches"] += 1
+                profile["frames"] += base_gpu.shape[0]
 
             pending_items.clear()
             return True
 
         expected_done_count = 1 if input_type == "video" else n_preprocess
 
-        # 4) Consume incoming batches
+        # Consume incoming batches
         while True:
             try:
                 item = queue.get()
@@ -748,40 +849,8 @@ class PipelineContext:
                 if not flush_pending():
                     return
 
-        # 5) Collect profiling results
         if profile_gpu:
-            torch.cuda.synchronize()
-
-            for pre_start, pre_end, infer_end, frame_count in stage_events:
-                profile["preprocess_ms"] += pre_start.elapsed_time(pre_end)
-                profile["inference_ms"] += pre_end.elapsed_time(infer_end)
-
-            for dibr_start, dibr_end, frame_count in dibr_events:
-                profile["dibr_ms"] += dibr_start.elapsed_time(dibr_end)
-
-            if profile["frames"]:
-                frames = profile["frames"]
-
-                print("\n===== GPU Stage Profile =====")
-                print(f"Frames:              {frames}")
-                print(f"GPU batches:         {profile['batches']}")
-                print(f"Preprocess total:    {profile['preprocess_ms']:.2f} ms")
-                print(f"Inference total:     {profile['inference_ms']:.2f} ms")
-                print(f"DIBR total:          {profile['dibr_ms']:.2f} ms")
-                print(f"NV12 buffer wait:    {profile['buffer_wait_ms']:.2f} ms")
-                print(f"Preprocess/frame:    {profile['preprocess_ms'] / frames:.3f} ms")
-                print(f"Inference/frame:     {profile['inference_ms'] / frames:.3f} ms")
-                print(f"DIBR/frame:          {profile['dibr_ms'] / frames:.3f} ms")
-                print(f"Buffer wait/frame:   {profile['buffer_wait_ms'] / frames:.3f} ms")
-
-                compute_ms = (
-                    profile["preprocess_ms"]
-                    + profile["inference_ms"]
-                    + profile["dibr_ms"]
-                )
-
-                print(f"Measured compute FPS: {frames * 1000 / compute_ms:.2f}")
-                print("=============================\n")
+            PipelineContext._print_gpu_profile(profile, stage_events, dibr_events)
 
         # Encoder worker receives its sentinel later through save_queue.
         if not direct_nv12:
@@ -793,7 +862,7 @@ class PipelineContext:
                     
             
     @staticmethod
-    def preprocess_worker(raw_queue: Queue, batch_size: int, processor, device, input_queue: Queue, hdr=False):
+    def preprocess_worker(raw_queue: Queue, batch_size: int, processor, device, input_queue: Queue):
         """Collect decoded frames into NumPy batches. GPU preprocessing is done in gpu_worker_loop."""
 
         batch_idx, batch_imgs, batch_names = [], [], []
@@ -856,15 +925,15 @@ class PipelineContext:
         result_dict,
         max_frames: int | None = None,
         gpu_id: int = 0,
-        profile_feeder: bool = False,
+        profile_gpu: bool = False,
     ):
         """Decode video with NVDEC and send CUDA RGB batches directly to gpu_worker_loop."""
 
         # Two batches let NVDEC work ahead while the current batch is consumed.
-        # At 4K RGB and batch=19 this buffer can use up to roughly 0.9 GiB VRAM.
         decoder_buffer_size = max(batch_size * 2, batch_size)
         decode_stream = torch.cuda.Stream(device=gpu_id)
-        init_started = time.perf_counter() if profile_feeder else 0.0
+        init_started = time.perf_counter() if profile_gpu else 0.0
+        
         decoder = nvc.ThreadedDecoder(
             video_path,
             buffer_size=decoder_buffer_size,
@@ -873,7 +942,11 @@ class PipelineContext:
             use_device_memory=True,
             output_color_type=nvc.OutputColorType.RGB,
         )
-        init_ms = (time.perf_counter() - init_started) * 1000.0 if profile_feeder else 0.0
+        
+        init_ms = (time.perf_counter() - init_started) * 1000.0 if profile_gpu else 0.0
+
+        if profile_gpu and hasattr(decoder, "enable_profiling"):
+            decoder.enable_profiling(True)
 
         total_frames = len(decoder)
         idx = 0
@@ -891,7 +964,7 @@ class PipelineContext:
         }
         stack_events = []
         last_ready_event = None
-        wall_started = time.perf_counter() if profile_feeder else 0.0
+        wall_started = time.perf_counter() if profile_gpu else 0.0
 
         try:
             while idx < total_frames:
@@ -902,9 +975,10 @@ class PipelineContext:
                     if request_size <= 0:
                         break
 
-                started = time.perf_counter() if profile_feeder else 0.0
+                started = time.perf_counter() if profile_gpu else 0.0
                 frames = decoder.get_batch_frames(request_size)
-                if profile_feeder:
+                
+                if profile_gpu:
                     profile["fetch_ms"] += (time.perf_counter() - started) * 1000.0
                 if not frames:
                     break
@@ -913,19 +987,21 @@ class PipelineContext:
                 # batch copy on one dedicated stream. This permits overlap with
                 # inference/DIBR running on the GPU worker's default stream.
                 with torch.cuda.stream(decode_stream):
-                    started = time.perf_counter() if profile_feeder else 0.0
+                    started = time.perf_counter() if profile_gpu else 0.0
                     frame_tensors = [torch.from_dlpack(frame) for frame in frames]
-                    if profile_feeder:
+                    
+                    if profile_gpu:
                         profile["dlpack_ms"] += (time.perf_counter() - started) * 1000.0
 
-                    if profile_feeder:
+                    if profile_gpu:
                         stack_start = torch.cuda.Event(enable_timing=True)
                         stack_end = torch.cuda.Event(enable_timing=True)
                         stack_start.record(decode_stream)
 
-                    started = time.perf_counter() if profile_feeder else 0.0
+                    started = time.perf_counter() if profile_gpu else 0.0
                     base_gpu = torch.stack(frame_tensors)
-                    if profile_feeder:
+
+                    if profile_gpu:
                         profile["stack_submit_ms"] += (time.perf_counter() - started) * 1000.0
                         stack_end.record(decode_stream)
 
@@ -933,37 +1009,45 @@ class PipelineContext:
                     ready_event.record(decode_stream)
                     last_ready_event = ready_event
 
-                if profile_feeder:
+                if profile_gpu:
                     stack_events.append((stack_start, stack_end))
+
                 indices = list(range(idx, idx + len(frames)))
 
-                started = time.perf_counter() if profile_feeder else 0.0
+                started = time.perf_counter() if profile_gpu else 0.0
+
                 try:
                     input_queue.put((indices, [None] * len(indices), base_gpu, ready_event))
                 except EOFError:
                     return
-                if profile_feeder:
+                    
+                if profile_gpu:
                     profile["queue_wait_ms"] += (time.perf_counter() - started) * 1000.0
 
                 idx += len(frames)
-                if profile_feeder:
+                if profile_gpu:
                     profile["frames"] += len(frames)
                     profile["batches"] += 1
         finally:
-            if profile_feeder:
+            if profile_gpu:
                 profile["wall_ms"] = (time.perf_counter() - wall_started) * 1000.0
 
             # Required for decoder-owned frame lifetime even when profiling is off.
             if last_ready_event is not None:
                 last_ready_event.synchronize()
 
-            if profile_feeder:
+            if profile_gpu:
                 for stack_start, stack_end in stack_events:
                     profile["stack_gpu_ms"] += stack_start.elapsed_time(stack_end)
 
+            decoder_profile = None
+            if profile_gpu and hasattr(decoder, "get_profiling_stats"):
+                decoder_profile = dict(decoder.get_profiling_stats())
+                decoder.enable_profiling(False)
+
             decoder.end()
             result_dict["frames"] = idx
-            if profile_feeder:
+            if profile_gpu:
                 result_dict["feeder_profile"] = dict(profile)
                 frames_count = max(profile["frames"], 1)
                 print("\n===== Threaded NVDEC Feeder Profile =====")
@@ -982,6 +1066,52 @@ class PipelineContext:
                 print(f"Stack GPU/frame:     {profile['stack_gpu_ms'] / frames_count:.3f} ms")
                 print(f"Queue wait/frame:    {profile['queue_wait_ms'] / frames_count:.3f} ms")
                 print(f"Feeder wall rate:    {profile['frames'] * 1000.0 / max(profile['wall_ms'], 0.001):.2f} FPS")
+                if decoder_profile is not None:
+                    producer_frames = max(int(decoder_profile["producer_frames"]), 1)
+                    consumer_frames = max(int(decoder_profile["consumer_frames"]), 1)
+                    decode_callback_other_ms = max(
+                        decoder_profile["nvdec_decode_callback_ms"]
+                        - decoder_profile["nvdec_decode_picture_ms"],
+                        0.0,
+                    )
+                    display_accounted_ms = (
+                        decoder_profile["nvdec_map_frame_ms"]
+                        + decoder_profile["nvdec_frame_allocation_ms"]
+                        + decoder_profile["nvdec_generate_output_ms"]
+                        + decoder_profile["nvdec_event_record_ms"]
+                        + decoder_profile["nvdec_unmap_frame_ms"]
+                    )
+                    display_other_ms = max(
+                        decoder_profile["nvdec_display_callback_ms"] - display_accounted_ms,
+                        0.0,
+                    )
+                    parser_other_ms = max(
+                        decoder_profile["nvdec_parse_ms"]
+                        - decoder_profile["nvdec_decode_callback_ms"]
+                        - decoder_profile["nvdec_display_callback_ms"],
+                        0.0,
+                    )
+
+                    def timing_line(label, total_ms, divisor=producer_frames):
+                        print(f"{label:<22}{total_ms:>10.2f} ms  ({total_ms / divisor:.3f} ms/frame)")
+
+                    print("--- NVDEC Decode breakdown ---")
+                    print(
+                        f"Callbacks: decode={decoder_profile['nvdec_decode_callbacks']}, "
+                        f"display={decoder_profile['nvdec_display_callbacks']}"
+                    )
+                    timing_line("Decode() total", decoder_profile["producer_decode_ms"])
+                    timing_line("  parser own/other", parser_other_ms)
+                    timing_line("  cuvidDecodePicture", decoder_profile["nvdec_decode_picture_ms"])
+                    timing_line("  decode cb other", decode_callback_other_ms)
+                    timing_line("  cuvidMapVideoFrame", decoder_profile["nvdec_map_frame_ms"])
+                    timing_line("  frame allocation", decoder_profile["nvdec_frame_allocation_ms"])
+                    timing_line("  GenerateOutput RGB", decoder_profile["nvdec_generate_output_ms"])
+                    timing_line("  event record", decoder_profile["nvdec_event_record_ms"])
+                    timing_line("  cuvidUnmapFrame", decoder_profile["nvdec_unmap_frame_ms"])
+                    timing_line("  display cb other", display_other_ms)
+                    timing_line("SPSC producer wait", decoder_profile["producer_push_wait_ms"])
+                    timing_line("SPSC consumer wait", decoder_profile["consumer_pop_wait_ms"], consumer_frames)
                 print("==========================================")
 
         try:
@@ -990,7 +1120,7 @@ class PipelineContext:
             return
         
     @staticmethod
-    def image_folder_feeder(folder_path, raw_queue, file_list,result_dict=None):
+    def image_folder_feeder(folder_path, raw_queue, file_list, result_dict=None, result_lock=None):
         """
         Reads images from assigned folder and pushes them into queue.
         """
@@ -1008,8 +1138,12 @@ class PipelineContext:
                 return                
             idx += 1
             
-        if result_dict:
-            result_dict["frames"] = result_dict.get("frames", 0) + idx
+        if result_dict is not None:
+            if result_lock is None:
+                result_dict["frames"] = result_dict.get("frames", 0) + idx
+            else:
+                with result_lock:
+                    result_dict["frames"] = result_dict.get("frames", 0) + idx
         
 
 

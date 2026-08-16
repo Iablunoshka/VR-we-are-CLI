@@ -13,7 +13,7 @@ Built for batch work, tuned for GPUs, and designed with a **multi-threaded** pip
 * **Pipeline parallelism** with queues: feeder → preprocess → GPU → convert → save
 * Depth via **Depth Anything V2 (Small/Base/Large)**
 * **Debugging**: Queue/Memory Monitor and Summary Report
-* **10-bit HDR video path** with HEVC/NVENC/libx265 support
+* GPU pipeline for **SDR BT.709** video (HDR is not supported yet)
 * Single-file **bootstrapper** (`setup_env.py`) to install PyTorch/FFmpeg-related dependencies
 
 ## GUI [beta]
@@ -26,14 +26,13 @@ Essentials and remains separate from the CLI core.
 
 ## Installation
 
-> Tested with **Python 3.12**.
+> Tested with **Python 3.12 x64** and NVIDIA Turing through Blackwell GPUs.
 
 1. **Install Python 3.12**
    [https://www.python.org/downloads/](https://www.python.org/downloads/)
 
-   For the tested Windows RTX 5090/CUDA environment, including the required
-   side-by-side CUDA 12.1 runtime and pinned package versions, follow
-   [ENVIRONMENT_PY312.md](ENVIRONMENT_PY312.md).
+   The runtime does not require CUDA Toolkit, Visual Studio or CMake. Follow
+   [ENVIRONMENT_PY312.md](ENVIRONMENT_PY312.md) for the tested GPU stack.
 
 2. **Get the sources**
 
@@ -71,10 +70,17 @@ python setup_env.py --gui
 
 This will:
 
-* install packages from `requirements.txt`,
-* detect **CUDA** and install a matching **PyTorch** wheel (falls back to CPU build),
-* check **FFmpeg** availability (prints tips if missing),
+* check Python, FFmpeg/FFprobe, `nvidia-smi`, GPU architecture and driver CUDA support,
+* install the pinned CUDA 13 stack and modified PyNvVideoCodec wheel,
+* install the remaining packages from `requirements.txt`,
 * install the GUI in editable mode with PySide6 Essentials when `--gui` is used.
+
+There is no CPU fallback. Use `python setup_env.py --check-only` to run only
+the preflight checks, or `--dry-run` to print installation commands.
+
+The Windows alpha includes its custom wheel in `wheels/`. Linux uses the same
+setup flow but currently requires a separately built modified wheel supplied as
+`python setup_env.py --pynv-wheel /path/to/wheel.whl`.
 
 > FFmpeg must be in `PATH`.
 > Windows (Chocolatey): `choco install ffmpeg`

@@ -9,17 +9,20 @@ if path not in sys.path:
 from threading import Thread
 from queue import Queue, Empty, Full
 from natsort import natsorted
-from dataclasses import fields
-from pathlib import Path
 import numpy as np
-import threading
-import time , cv2 , signal 
+import time, cv2, signal, torch
 from depthestimator import DepthEstimator 
 from gpu_converter import DIBRCore, RGBSBSConverter, NV12SBSConverter
 from pipeline_core import PipelineContext
-from sbsutils import force_exit , debug_report , load_preset , merge_with_preset , validate_config , detect_nvenc_support ,  clean_output_pngs
-# --- HDR (10-bit) --- isolated HDR module; imported by name to avoid clashing with the `hdr` flag.
-from hdr import select_codec
+from sbsutils import (
+    clean_output_pngs,
+    debug_report,
+    detect_nvenc_support,
+    force_exit,
+    load_preset,
+    merge_with_preset,
+    validate_config,
+)
 
 
 class CloseableQueue(Queue):
@@ -100,6 +103,7 @@ def init_pipeline(
     debug: bool = False,
     depth_scale: float = 1.0,
     depth_offset: float = 0.0,
+    crop_size: int = 0,
     switch_sides: bool = False,
     symetric: bool = False,
     blur_radius: int = 19,
@@ -115,13 +119,38 @@ def init_pipeline(
     """
     Initialize the multistage conversion pipeline.
     """
+
+    validate_config({
+        "input_type": input_type,
+        "video_path": video_path,
+        "output_path": output_path,
+        "batch_size": batch_size,
+        "in_queue": in_queue,
+        "r_queue": r_queue,
+        "s_queue": s_queue,
+        "p_queue": p_queue,
+        "n_preprocess": n_preprocess,
+        "n_processors": n_processors,
+        "n_savers": n_savers,
+        "n_feeders": n_feeders,
+        "codec": codec if input_type == "video" else None,
+        "video_quality": video_quality if input_type == "video" else None,
+        "infer_accum_batches": infer_accum_batches if input_type != "i2i" else None,
+        "crop_size": crop_size,
+        "blur_radius": blur_radius,
+        "hdr": hdr,
+    })
         
     # --- Detect and prepare input source ---
     # Depending on input_type, determine dimensions, FPS, and I/O codec, crf
+    frame_count = 0
     if input_type == "video":
         cap = cv2.VideoCapture(video_path)
         ok, frame = cap.read()
         fps = cap.get(cv2.CAP_PROP_FPS)
+        detected_frames = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        if detected_frames and np.isfinite(detected_frames):
+            frame_count = max(0, int(round(detected_frames)))
         if not fps or np.isnan(fps):
             fps = 30.0
             print("[warn] FPS autodetect failed - defaulting to 30")
@@ -132,10 +161,7 @@ def init_pipeline(
         cudnn_benchmark = True
        
         # Encoder selection
-        if hdr:
-            # --- HDR (10-bit) --- use HEVC encoder instead of SDR H.264
-            codec = select_codec(hdr_encoder, bool(master_display))
-        elif not codec or codec == "auto":
+        if not codec or codec == "auto":
             if W*2 <= 4096 and H <= 4096 and detect_nvenc_support():
                 codec = "h264_nvenc"
                 print("NVENC available — using GPU encoder (h264_nvenc).")
@@ -146,8 +172,8 @@ def init_pipeline(
             if W*2 <= 4096 and H <= 4096 and detect_nvenc_support():
                 pass
             else:
-                codec = "libx264"
-                print("h264_nvenc not available — using CPU encoder (libx264).")
+                codec = "hevc_nvenc"
+                print("h264_nvenc not available — using encoder (hevc_nvenc).")
 
         # Definitions of quality
         if video_quality == "low":
@@ -178,26 +204,38 @@ def init_pipeline(
         fps = 0
         H, W = first.shape[:2]   
     
-    estimator.load_model(model_name,cudnn_benchmark)
-    processor = estimator.processor
-    device = estimator.device
-    
     direct_nv12 = (
         input_type == "video"
         and not hdr
         and codec in ("h264_nvenc", "hevc_nvenc")
     )
 
-    core = DIBRCore(H, W, batch_size)
+    validate_config({
+        "input_type": input_type,
+        "frame_width": W,
+        "frame_height": H,
+        "direct_nv12": direct_nv12,
+    })
+
+    estimator.load_model(model_name,cudnn_benchmark)
+    processor = estimator.processor
+    device = estimator.device
+    gpu_id = torch.cuda.current_device() if device.type == "cuda" else 0
+    
+    if device.type == "cuda":
+        device = torch.device("cuda", gpu_id)
+        estimator.device = device
+
+    autocast = estimator.resolve_autocast_mode(autocast)
+    infer_accum_batches = max(1, int(infer_accum_batches or 1)) if estimator.device.type == "cuda" else 1
+
+    core = DIBRCore(H, W, batch_size, device=device)
 
     if direct_nv12:
         SBSConverter = NV12SBSConverter(core)
     else:
         SBSConverter = RGBSBSConverter(core)
     
-    autocast = estimator.resolve_autocast_mode(autocast)
-    infer_accum_batches = max(1, int(infer_accum_batches or 1)) if estimator.device.type == "cuda" else 1
-
     # Create thread-safe queues to connect pipeline stages
     raw_q = CloseableQueue(maxsize=r_queue)  # feeders → preprocessors
     inp_q = CloseableQueue(maxsize=in_queue) # preprocessors → GPU inference
@@ -221,13 +259,14 @@ def init_pipeline(
         n_savers=n_savers,
         model_name=model_name,
         codec=codec, debug=debug,
-        H=H, W=W, fps=fps,
+        H=H, W=W, fps=fps, frame_count=frame_count,
         raw_queue=raw_q,
         input_queue=inp_q,
         save_queue=save_q,
         process_queue=proc_q,
         depth_scale=depth_scale,
         depth_offset=depth_offset,
+        crop_size=crop_size,
         switch_sides=switch_sides,
         symetric=symetric,
         blur_radius=blur_radius,
@@ -236,8 +275,9 @@ def init_pipeline(
         video_quality=video_quality,
         autocast=autocast,
         infer_accum_batches=infer_accum_batches,
+        gpu_id=gpu_id,
         direct_nv12=direct_nv12,
-        hdr=hdr, master_display=master_display, max_cll=max_cll  # --- HDR (10-bit) ---
+        hdr=hdr, master_display=master_display, max_cll=max_cll  
     )
     
     #if debug:
@@ -250,95 +290,65 @@ def init_pipeline(
     #        print(f"{name:>15}: {value}")
     
     max_frames = None
+
+    def make_worker(target, *args):
+        return Thread(target=PipelineContext.worker_entry, args=(ctx, target, *args))
         
     # --- Build and assign pipeline worker threads ---
     # Feeders -> Preprocessors -> GPU inference -> Processors -> Savers
 
     if input_type == "video":
         ctx.result_dict = {"frames": 0}
-        ctx.feeders = [Thread(target=PipelineContext.video_feeder, args=(ctx.video_path, ctx.input_queue, ctx.batch_size, ctx.result_dict, max_frames, 0,))]
+        ctx.feeders = [make_worker(PipelineContext.video_feeder, ctx.video_path, ctx.input_queue, ctx.batch_size, ctx.result_dict, max_frames, ctx.gpu_id)]
     elif input_type == "folder":
         ctx.result_dict = {"frames": 0} 
         chunks = np.array_split(files, n_feeders)
         for chunk in chunks:
-            ctx.feeders.append(Thread(
-                target=PipelineContext.image_folder_feeder,
-                args=(video_path, raw_q, list(chunk),ctx.result_dict)))
+            ctx.feeders.append(make_worker(
+                PipelineContext.image_folder_feeder,
+                video_path, raw_q, list(chunk), ctx.result_dict, ctx.result_lock))
     else:
         ctx.result_dict = {"frames": 1}
-        ctx.feeders = [Thread(
-            target=PipelineContext.image_folder_feeder,
-            args=(os.path.dirname(video_path), raw_q, [os.path.basename(video_path)])
-        )]
+        ctx.feeders = [make_worker(
+            PipelineContext.image_folder_feeder,
+            os.path.dirname(video_path), raw_q, [os.path.basename(video_path)])]
     
     for _ in range(n_preprocess):
-        ctx.pre_workers.append(Thread(target=PipelineContext.preprocess_worker,args=(raw_q, batch_size, estimator.processor, estimator.device, inp_q, ctx.hdr)))
+        ctx.pre_workers.append(make_worker(
+            PipelineContext.preprocess_worker,
+            raw_q, batch_size, estimator.processor, estimator.device, inp_q))
         
-    ctx.gpu_worker = Thread(
-    target=PipelineContext.gpu_worker_loop,
-    args=(
-        estimator, processor, SBSConverter, inp_q, proc_q,save_q,
+    ctx.gpu_worker = make_worker(
+        PipelineContext.gpu_worker_loop,
+        estimator, processor, SBSConverter, inp_q, proc_q, save_q,
         model_name, n_preprocess, H, W, n_processors,
         cudnn_benchmark, input_type, ctx.autocast,
         ctx.infer_accum_batches, ctx.depth_scale,
-        ctx.depth_offset, ctx.switch_sides,
-        ctx.symetric, ctx.blur_radius,ctx.batch_size,fps,codec,
-    ),
-)
+        ctx.depth_offset, ctx.crop_size, ctx.switch_sides,
+        ctx.symetric, ctx.blur_radius, ctx.batch_size, fps, codec, ctx.gpu_id, ctx.debug,
+    )
                             
     if direct_nv12:
         ctx.processors = []
         ctx.savers = [
-            Thread(
-                target=PipelineContext.nv12_encode_mux_worker_thread,
-                args=(
-                    save_q,   # ready NV12 batches
-                    proc_q,   # free NV12 buffer pool
-                    video_path,
-                    output_path,
-                    fps,
-                    codec,
-                    ctx,
-                ),
-            )
-        ]
+            make_worker(PipelineContext.nv12_encode_mux_worker_thread,save_q,proc_q,video_path,output_path,fps,codec,ctx,)]
     else:
-        ctx.processors = [
-            Thread(
-                target=PipelineContext.process_worker,
-                args=(proc_q, save_q),
-            )
-            for _ in range(n_processors)
-        ]
+        ctx.processors = [make_worker(PipelineContext.process_worker, proc_q, save_q)for _ in range(n_processors)]
 
         if input_type == "video":
-            ctx.savers = [
-                Thread(
-                    target=PipelineContext.video_worker_thread,
-                    args=(save_q, video_path, output_path, W * 2, H, fps, codec, crf, cq, ctx),
-                )
-            ]
+            ctx.savers = [make_worker(PipelineContext.video_worker_thread,save_q, video_path, output_path, W * 2, H, fps, codec, crf, cq, ctx)]
+            
         elif input_type == "folder":
-            ctx.savers = [
-                Thread(
-                    target=PipelineContext.save_worker_thread,
-                    args=(save_q, output_path, input_type),
-                )
-                for _ in range(n_savers)
-            ]
+            ctx.savers = [make_worker(PipelineContext.save_worker_thread, save_q, output_path, input_type)for _ in range(n_savers)]
+            
         else:
-            ctx.savers = [
-                Thread(
-                    target=PipelineContext.save_worker_thread,
-                    args=(save_q, output_path, input_type),
-                )
-            ]
+            ctx.savers = [make_worker(PipelineContext.save_worker_thread, save_q, output_path, input_type)]
         
 
     # --- Optional monitoring tools for debugging ---
     if debug:
         from monitor import MemoryMonitor, QueueMonitor
-        ctx.mem_mon = MemoryMonitor(interval=0.5, include_children=True)
+        ctx.mem_mon = MemoryMonitor(interval=0.1, include_children=True, gpu_id=ctx.gpu_id)
         ctx.q_mon = QueueMonitor(
             queues={"raw": raw_q, "input": inp_q, "process": proc_q, "save": save_q},
             interval=0.25
@@ -403,8 +413,8 @@ if __name__ == "__main__":
     import argparse
     version = "1.1.6"
     parser = argparse.ArgumentParser(
-        description="VR we are! CLI pipeline (video → 3D SBS video, "
-                    "folder → batch of images, i2i → single/multiple images one-by-one)."
+        description="VR we are! CLI pipeline (video -> 3D SBS video, "
+                    "folder -> batch of images, i2i -> single/multiple images one-by-one)."
     )
     parser.add_argument("--version","-v", action="version", version=f"VR We Are {version} (CLI)")
     parser.add_argument("--input", "-i", type=str, required=True,
@@ -416,8 +426,8 @@ if __name__ == "__main__":
                         help=("Path to output.\n"
                               "  video: output video file (e.g. out.mp4)\n"
                               "  folder: output directory for processed images\n"
-                              "  i2i: if input is a single image → output file; "
-                              "if input is a folder → output directory"))
+                              "  i2i: if input is a single image -> output file; "
+                              "if input is a folder -> output directory"))
     parser.add_argument("--batch-size", "-b", type=int, default=None,
                         help="Batch size for processing (video/folder modes only)")
     parser.add_argument("--model", "-m", type=str, default=None,
@@ -443,19 +453,19 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true",
                     help="Enable debug mode with memory/queue monitoring")
     parser.add_argument("--preset","-p", type=str, choices=["minimum", "balance", "max_quality"],
-                        help="Use a predefined configuration preset")
+                        help="Use a predefined configuration preset (default: minimum)")
     parser.add_argument("--clean-output-pngs", action="store_true",
                     help="Folder mode only: delete existing PNG files in output folder before processing")
 
     # Queues
     parser.add_argument("--in-queue", type=int, default=None,
-                        help="Max size of input queue (CPU → GPU)")
+                        help="Max size of input queue (CPU -> GPU)")
     parser.add_argument("--r-queue", type=int, default=None,
-                        help="Max size of raw queue (disk → preprocess)")
+                        help="Max size of raw queue (disk -> preprocess)")
     parser.add_argument("--s-queue", type=int, default=None,
-                        help="Max size of save queue (process → disk)")
+                        help="Max size of save queue (process -> disk)")
     parser.add_argument("--p-queue", type=int, default=None,
-                        help="Max size of process queue (GPU → CPU)")
+                        help="Max size of process queue (GPU -> CPU)")
 
     # Streams 
     parser.add_argument("--feeders", type=int, default=None,
@@ -463,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument("--preprocess", "-pre", type=int, default=None,
                         help="Number of CPU preprocess threads")
     parser.add_argument("--processors", type=int, default=None,
-                        help="Number of processing threads (depth→SBS)")
+                        help="Number of processing threads (depth -> SBS)")
     parser.add_argument("--savers", type=int, default=None,
                         help="Number of saver threads "
                              "(video/i2i: must be 1; folder: can be >1)")
@@ -473,6 +483,8 @@ if __name__ == "__main__":
                         help="Scale factor for depth map (default=1.0)")
     parser.add_argument("--depth-offset", type=float, default=None,
                         help="Offset for depth map (default=0.0)")
+    parser.add_argument("--crop-size", type=int, default=None,
+                        help="Black crop width at the warped edge (default=0)")
     parser.add_argument("--switch-sides", action="store_true",default=None,
                         help="Swap left/right images in output (default=False)")
     parser.add_argument("--symmetric", dest="symetric", action="store_true",default=None,
@@ -480,10 +492,9 @@ if __name__ == "__main__":
     parser.add_argument("--blur-radius", type=int, default=None,
                         help="Blur radius applied to depth map before shifting (default=19)")
 
-    # --- HDR (10-bit) --- true 10-bit HDR output instead of tonemapping to SDR (video input only).
-    # See cli/sbs/hdr.py for the whole HDR path; without --hdr none of it runs.
+    # Reserved for a future true 10-bit GPU path.
     parser.add_argument("--hdr",action=argparse.BooleanOptionalAction, default=None,
-                        help="Keep 10-bit HDR (PQ/BT.2020) output instead of tonemapping to SDR (video only)")
+                        help="Reserved; the GPU pipeline currently rejects HDR input")
     parser.add_argument("--hdr-encoder", type=str, choices=["auto", "nvenc", "libx265"], default=None,
                         help="HDR HEVC encoder: auto (libx265 if HDR10 static metadata, else nvenc) | nvenc | libx265")
     parser.add_argument("--master-display", type=str, default=None,
@@ -497,13 +508,13 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, force_exit)
     signal.signal(signal.SIGTERM, force_exit)
     
-    estimator = DepthEstimator()
     preset_data = {}
 
     # --- i2i (image-to-image) mode ---
     # Processes a single image or folder of images individually (no batching).
     if args.input_type == "i2i":
         validate_config(args, parser)
+        estimator = DepthEstimator()
 
         if os.path.isfile(args.input):
             # single image
@@ -541,82 +552,54 @@ if __name__ == "__main__":
                 autocast=args.autocast,
                 input_type=args.input_type,
                 debug=args.debug,
-                depth_scale=args.depth_scale or 1.0,
-                depth_offset=args.depth_offset or 0.0,
-                switch_sides=args.switch_sides or False,
-                symetric=args.symetric or False,
-                blur_radius=args.blur_radius or 19
+                depth_scale=args.depth_scale if args.depth_scale is not None else 1.0,
+                depth_offset=args.depth_offset if args.depth_offset is not None else 0.0,
+                crop_size=args.crop_size if args.crop_size is not None else 0,
+                switch_sides=bool(args.switch_sides),
+                symetric=bool(args.symetric),
+                blur_radius=args.blur_radius if args.blur_radius is not None else 19,
             )
             run_pipeline(ctx)
         debug_report(ctx)
-    # ---  video and folder mods ---
+    # --- video and folder modes ---
     else:
-        if args.preset:
-            preset_data = load_preset(args.input_type, args.preset)
-            print(f"Loaded preset '{args.preset}' for mode '{args.input_type}'")
-            
-            merged_params = merge_with_preset(args, preset_data, PipelineContext)
-            
-            #for k, v in merged_params.items():
-            #    print(f"{k:>15}: {v}")
+        preset_name = args.preset or "minimum"
+        preset_variant = None
 
-            validate_config({**merged_params, "clean_output_pngs": args.clean_output_pngs}, parser)
-            
-            if args.clean_output_pngs:
-                clean_output_pngs(
-                    merged_params["output_path"],
-                    merged_params["video_path"]
-                )
-            
-            ctx = init_pipeline(
-                version,
-                estimator=estimator,
-                **merged_params
+        if args.input_type == "video":
+            # TODO: share one video probe with init_pipeline.
+            cap = cv2.VideoCapture(args.input)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok:
+                parser.error(f"Failed to read first frame from {args.input}")
+
+            height, width = frame.shape[:2]
+            preset_variant = "1080p" if width * height <= 1920 * 1080 else "high_resolution"
+
+        preset_data = load_preset(args.input_type, preset_name, preset_variant)
+        preset_location = f"{args.input_type}.{preset_variant}" if preset_variant else args.input_type
+        print(f"Loaded preset '{preset_name}' from '{preset_location}'")
+
+        merged_params = merge_with_preset(args, preset_data, PipelineContext)
+        validate_config({**merged_params, "clean_output_pngs": args.clean_output_pngs}, parser)
+        estimator = DepthEstimator()
+
+        if args.clean_output_pngs:
+            clean_output_pngs(
+                merged_params["output_path"],
+                merged_params["video_path"]
             )
 
-            run_pipeline(ctx)
-            estimator.print_depth_profile()
-            debug_report(ctx)
-        else:
-            validate_config(args, parser)
-            if args.clean_output_pngs:
-                clean_output_pngs(args.output, args.input)
-            
-            ctx = init_pipeline(
-                version,
-                video_path=args.input,
-                estimator=estimator,
-                output_path=args.output,
-                batch_size=args.batch_size or 5,
-                in_queue=args.in_queue or 16,
-                r_queue=args.r_queue or 16,
-                s_queue=args.s_queue or 16,
-                p_queue=args.p_queue or 16,
-                n_preprocess=args.preprocess or 2,
-                n_processors=args.processors or 8,
-                n_savers=args.savers or 1,
-                n_feeders=args.feeders or 1,
-                model_name=args.model or "depth-anything/Depth-Anything-V2-Base-hf",
-                codec=args.codec or None,
-                autocast=args.autocast or None,
-                input_type=args.input_type,
-                debug=args.debug,
-                depth_scale=args.depth_scale or 1.0,
-                depth_offset=args.depth_offset or 0.0,
-                switch_sides=args.switch_sides or False,
-                symetric=args.symetric or False,
-                blur_radius=args.blur_radius or 19,
-                video_quality=args.quality or "medium",
-                infer_accum_batches=args.infer_accum_batches or None,
-                # --- HDR (10-bit) ---
-                hdr=args.hdr if args.hdr is not None else False,
-                hdr_encoder=args.hdr_encoder or "auto",
-                master_display=args.master_display,
-                max_cll=args.max_cll
-            )
-            run_pipeline(ctx)
-            estimator.print_depth_profile()
-            debug_report(ctx)
+        ctx = init_pipeline(
+            version,
+            estimator=estimator,
+            **merged_params
+        )
+
+        run_pipeline(ctx)
+        estimator.print_depth_profile()
+        debug_report(ctx)
         
 
 
