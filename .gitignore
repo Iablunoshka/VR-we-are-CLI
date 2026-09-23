@@ -23,10 +23,13 @@ dist/
 *.egg
 *.whl
 
+
 # Test output and locally generated media
 _tmp_test_*/
 test_media/
 vfr_test_results/
+*.mp4
+backup/
 
 # IDE and operating-system files
 .idea/
