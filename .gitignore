@@ -26,6 +26,7 @@ dist/
 # Test output and locally generated media
 _tmp_test_*/
 test_media/
+vfr_test_results/
 
 # IDE and operating-system files
 .idea/
