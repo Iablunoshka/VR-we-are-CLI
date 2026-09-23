@@ -109,265 +109,14 @@ class PipelineContext:
                 print(f"{target.__name__} failed: {exc}")
             graceful_shutdown(ctx)
 
+
     @staticmethod
-    def create_nv12_encoder(width: int, height: int, fps: float, codec: str, gpu_id: int):
-        """
-        Create a GPU-input NV12 encoder using the verified PyNvVideoCodec contract.
-        """
-        codec_map = {
-            "h264_nvenc": "h264",
-            "hevc_nvenc": "hevc",
-        }
+    def nv12_encode_worker(ready_queue, free_buffer_queue, video_path, output_path,
+                           fps, codec, ctx):
+        """Consume GPU results; flush NVENC and wait for the final FFmpeg mux."""
+        from video_mux import nv12_encode_mux_worker
 
-        try:
-            encoder_codec = codec_map[codec]
-        except KeyError:
-            raise ValueError(f"Direct NV12 encoding does not support codec: {codec}")
-            
-        return nvc.CreateEncoder(
-            width,
-            height,
-            "NV12",
-            False,
-            gpu_id=gpu_id,
-            codec=encoder_codec,
-            fps=str(fps),
-            bf="1",
-            preset="P1",
-            rc="constqp",
-            constqp="21",
-            gop=str(round(fps * 2)),
-            idrperiod=str(round(fps * 2)),
-            repeatspspps="1",
-            extra_output_delay="8",
-            split_encode_mode="NV_ENC_SPLIT_THREE_FORCED_MODE",
-        )
-                
-    @staticmethod
-    def nv12_encode_mux_worker_thread(
-        ready_queue: Queue,
-        free_buffer_queue: Queue,
-        video_path: str,
-        output_path: str,
-        fps: float,
-        codec: str,
-        ctx,
-        profile_gpu: bool = False
-    ):
-        """
-        Encode ready CUDA NV12 batches and mux them with the original audio.
-        """
-        profile_encoder_internal = False
-
-        bitstream_format = {
-            "h264_nvenc": "h264",
-            "hevc_nvenc": "hevc",
-        }.get(codec)
-
-        if bitstream_format is None:
-            raise ValueError(f"Unsupported direct NV12 codec: {codec}")
-
-        fps_q = Fraction(str(fps)).limit_denominator(1001)
-        fps_text = f"{fps_q.numerator}/{fps_q.denominator}"
-        time_base = f"{fps_q.denominator}/{fps_q.numerator}"
-        duration_args = []
-        if ctx.frame_count > 0:
-            duration = Fraction(ctx.frame_count * fps_q.denominator, fps_q.numerator)
-            duration_args = ["-t", f"{float(duration):.9f}"]
-
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel", "info",
-
-            # 1) Encoded elementary video
-            "-r", fps_text,
-            "-f", bitstream_format,
-            "-i", "pipe:0",
-
-            # 2) Original audio
-            "-i", video_path,
-
-            "-map", "0:v:0",
-            "-map", "1:a:0?",
-
-            # TODO: Preserve source frame PTS through NVDEC instead of forcing CFR timestamps.
-            # 3) Assign timestamps without re-encoding
-            "-c:v", "copy",
-            "-bsf:v", f"setts=pts=N:dts=N:duration=1:time_base={time_base}",
-
-            "-c:a", "copy",
-        ] + duration_args + [
-            output_path,
-        ]
-
-        encoder = PipelineContext.create_nv12_encoder(
-            width=ctx.W * 2,
-            height=ctx.H,
-            fps=fps,
-            codec=codec,
-            gpu_id=ctx.gpu_id,
-        )
-
-        if profile_gpu and profile_encoder_internal and hasattr(encoder, "EnableProfiling"):
-            encoder.EnableProfiling(True)
-
-        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-        stats = {
-            "queue_wait_ms": 0.0,
-            "event_wait_ms": 0.0,
-            "encode_ms": 0.0,
-            "pipe_write_ms": 0.0,
-            "buffer_return_ms": 0.0,
-            "frames": 0,
-            "packets": 0,
-            "bytes": 0,
-            "batches": 0,
-        }
-
-        try:
-            while True:
-                t0 = time.perf_counter() if profile_gpu else 0.0
-
-                try:
-                    item = ready_queue.get()
-                except EOFError:
-                    break
-
-                if profile_gpu:
-                    stats["queue_wait_ms"] += (time.perf_counter() - t0) * 1000.0
-
-                if item is None:
-                    break
-
-                nv12_batch, ready_event, frame_count = item
-
-                if not isinstance(nv12_batch, NV12CudaBatch):
-                    raise TypeError("ready_queue returned an invalid NV12 buffer")
-
-                try:
-                    # 1) Wait for DIBR completion
-                    t0 = time.perf_counter() if profile_gpu else 0.0
-                    ready_event.synchronize()
-                    if profile_gpu:
-                        stats["event_wait_ms"] += (time.perf_counter() - t0) * 1000.0
-
-                    # 2) Measure Encode and pipe write separately
-                    for frame_index in range(frame_count):
-                        t0 = time.perf_counter() if profile_gpu else 0.0
-                        packets = encoder.Encode(nv12_batch.frame(frame_index))
-                        if profile_gpu:
-                            stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
-                            stats["frames"] += 1
-
-                        for packet in packets:
-                            data = packet["data"]
-
-                            if profile_gpu:
-                                stats["packets"] += 1
-                                stats["bytes"] += len(data)
-
-                            t0 = time.perf_counter() if profile_gpu else 0.0
-                            proc.stdin.write(data)
-                            if profile_gpu:
-                                stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
-
-                    if profile_gpu:
-                        stats["batches"] += 1
-
-                finally:
-                    t0 = time.perf_counter() if profile_gpu else 0.0
-
-                    try:
-                        free_buffer_queue.put(nv12_batch)
-                    except EOFError:
-                        pass
-
-                    if profile_gpu:
-                        stats["buffer_return_ms"] += (time.perf_counter() - t0) * 1000.0
-
-            # 4) Flush delayed encoder packets
-            t0 = time.perf_counter() if profile_gpu else 0.0
-            tail_packets = encoder.EndEncode()
-            if profile_gpu:
-                stats["encode_ms"] += (time.perf_counter() - t0) * 1000.0
-
-            for packet in tail_packets:
-                data = packet["data"]
-                if profile_gpu:
-                    stats["packets"] += 1
-                    stats["bytes"] += len(data)
-
-                t0 = time.perf_counter() if profile_gpu else 0.0
-                proc.stdin.write(data)
-                if profile_gpu:
-                    stats["pipe_write_ms"] += (time.perf_counter() - t0) * 1000.0
-
-            if profile_gpu:
-                frames = max(stats["frames"], 1)
-                internal_stats = (
-                    encoder.GetProfilingStats()
-                    if profile_encoder_internal and hasattr(encoder, "GetProfilingStats")
-                    else None
-                )
-                print("\n===== NV12 Encoder Worker Profile =====")
-                print(f"Frames:              {stats['frames']}")
-                print(f"Batches:             {stats['batches']}")
-                print(f"Packets:             {stats['packets']}")
-                print(f"Encoded bytes:       {stats['bytes']}")
-                print(f"Ready queue wait:    {stats['queue_wait_ms']:.2f} ms")
-                print(f"CUDA event wait:     {stats['event_wait_ms']:.2f} ms")
-                print(f"Encode total:        {stats['encode_ms']:.2f} ms")
-                print(f"Pipe write total:    {stats['pipe_write_ms']:.2f} ms")
-                print(f"Buffer return:       {stats['buffer_return_ms']:.2f} ms")
-                print(f"Event wait/frame:    {stats['event_wait_ms'] / frames:.3f} ms")
-                print(f"Encode/frame:        {stats['encode_ms'] / frames:.3f} ms")
-                print(f"Pipe write/frame:    {stats['pipe_write_ms'] / frames:.3f} ms")
-
-                if internal_stats is not None:
-                    internal_frames = max(int(internal_stats["frames"]), 1)
-                    print("--- PyNvVideoCodec Encode internals ---")
-                    print(f"Input preparation:   {internal_stats['input_prep_cpu_ms']:.2f} ms")
-                    print(f"Input submit CPU:    {internal_stats['input_cpu_ms']:.2f} ms")
-                    print(f"EncodeFrame CPU:     {internal_stats['encode_frame_cpu_ms']:.2f} ms")
-                    print(f"GIL reacquire wait:  {internal_stats['gil_reacquire_cpu_ms']:.2f} ms")
-                    print(f"Packet packing CPU:  {internal_stats['packet_pack_cpu_ms']:.2f} ms")
-                    print(f"Input prep/frame:    {internal_stats['input_prep_cpu_ms'] / internal_frames:.3f} ms")
-                    print(f"Input CPU/frame:     {internal_stats['input_cpu_ms'] / internal_frames:.3f} ms")
-                    print(f"EncodeFrame/frame:   {internal_stats['encode_frame_cpu_ms'] / internal_frames:.3f} ms")
-                    print(f"GIL wait/frame:      {internal_stats['gil_reacquire_cpu_ms'] / internal_frames:.3f} ms")
-                    print(f"Packet pack/frame:   {internal_stats['packet_pack_cpu_ms'] / internal_frames:.3f} ms")
-                print("===============================\n")
-
-        except Exception as exc:
-            print(f"NV12 encode/mux worker failed - {exc}")
-            ctx.fatal_error = True
-            graceful_shutdown(ctx)
-
-        finally:
-            try:
-                del encoder
-            except Exception:
-                pass
-
-            try:
-                if proc.stdin:
-                    proc.stdin.close()
-            except Exception:
-                pass
-
-            try:
-                return_code = proc.wait()
-            except Exception:
-                proc.kill()
-                return
-
-            if return_code != 0 and not ctx.fatal_error:
-                print(f"FFmpeg mux failed with code {return_code}")
-                ctx.fatal_error = True
+        nv12_encode_mux_worker(ready_queue, free_buffer_queue, video_path, output_path,fps, codec, ctx)
 
     @staticmethod
     def video_worker_thread(save_queue: Queue,video_path, output_path: str, width: int, height: int, fps: float,codec: str,crf: int, cq: int,ctx):
@@ -717,13 +466,14 @@ class PipelineContext:
         def send_nv12_result(
             nv12_batch: NV12CudaBatch,
             frame_count: int,
+            pts,
         ) -> bool:
             # The event is recorded after all Torch/CuPy work for this buffer.
             ready_event = torch.cuda.Event()
             ready_event.record(torch.cuda.current_stream(device))
 
             try:
-                save_queue.put((nv12_batch, ready_event, frame_count))
+                save_queue.put((nv12_batch, ready_event, frame_count, pts))
             except EOFError:
                 return False
 
@@ -767,6 +517,7 @@ class PipelineContext:
                 nv12_output = None
 
                 if direct_nv12:
+                    pts = item[4]
                     nv12_output = acquire_nv12_buffer()
 
                     if nv12_output is None:
@@ -798,7 +549,7 @@ class PipelineContext:
                     if sbs_result is not nv12_output:
                         raise RuntimeError("NV12 converter returned the wrong output buffer")
 
-                    if not send_nv12_result(sbs_result, chunk_size):
+                    if not send_nv12_result(sbs_result, chunk_size, pts):
                         return False
                 else:
                     keys = indices if input_type == "video" else names
@@ -833,7 +584,7 @@ class PipelineContext:
 
                 continue
 
-            if len(item) == 4:
+            if input_type == "video":
                 # The RGB batch is produced on the feeder's dedicated CUDA
                 # stream. Insert a device-side dependency without blocking the
                 # Python thread, then register this consumer stream with the
@@ -977,6 +728,7 @@ class PipelineContext:
 
                 started = time.perf_counter() if profile_gpu else 0.0
                 frames = decoder.get_batch_frames(request_size)
+                pts = [int(frame.getPTS()) for frame in frames]
                 
                 if profile_gpu:
                     profile["fetch_ms"] += (time.perf_counter() - started) * 1000.0
@@ -1017,7 +769,7 @@ class PipelineContext:
                 started = time.perf_counter() if profile_gpu else 0.0
 
                 try:
-                    input_queue.put((indices, [None] * len(indices), base_gpu, ready_event))
+                    input_queue.put((indices, [None] * len(indices), base_gpu, ready_event, pts))
                 except EOFError:
                     return
                     

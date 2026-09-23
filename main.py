@@ -330,8 +330,7 @@ def init_pipeline(
                             
     if direct_nv12:
         ctx.processors = []
-        ctx.savers = [
-            make_worker(PipelineContext.nv12_encode_mux_worker_thread,save_q,proc_q,video_path,output_path,fps,codec,ctx,)]
+        ctx.savers = [make_worker(PipelineContext.nv12_encode_worker,save_q,proc_q,video_path,output_path,fps,codec,ctx,)]
     else:
         ctx.processors = [make_worker(PipelineContext.process_worker, proc_q, save_q)for _ in range(n_processors)]
 

@@ -300,7 +300,7 @@ def validate_config(params, parser=None):
                 "Direct NV12 video processing requires even input width and height "
                 f"(got {frame_width}x{frame_height})"
             )
-        
+
     # Folder output cleanup
     if clean_output_pngs and input_type != "folder":
         fail("--clean-output-pngs can only be used with --input-type=folder")

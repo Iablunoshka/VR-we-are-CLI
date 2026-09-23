@@ -10,16 +10,21 @@ from pathlib import Path
 import torch_detect
 
 
-CUPY_REQUIREMENT = "cupy-cuda13x[ctk]==14.1.1"
+CUPY_WINDOWS_REQUIREMENT = "cupy-cuda13x[ctk]==14.1.1"
+CUPY_LINUX_REQUIREMENT = "cupy-cuda13x==14.1.1"
 TRITON_WINDOWS_REQUIREMENT = "triton-windows==3.5.1.post24"
 PYNV_VERSION = "2.2.0"
-PYNV_WINDOWS_SHA256 = "74112459fe31eeeb2373d124bac29da1eb0900ed953e0e02b71ab9fc66dd897f"
+PYNV_WHEEL_SHA256 = {
+    "Windows": "74112459fe31eeeb2373d124bac29da1eb0900ed953e0e02b71ab9fc66dd897f",
+    "Linux": "2e3f1252ef3d3d8c5eb070430e0d3238cfc8438bf8e0f11f5eaf427eb431d158",
+}
 SUPPORTED_SYSTEMS = {"Windows", "Linux"}
 REQUIRED_PROJECT_FILES = (
     "main.py",
     "presets.json",
     "requirements.txt",
     "torch_detect.py",
+    "video_mux.py",
 )
 
 
@@ -98,20 +103,18 @@ def wheel_matches_platform(path, system):
         return False
     if system == "Windows":
         return name.endswith("-win_amd64.whl")
-    return name.endswith("-x86_64.whl") and ("manylinux" in name or "linux" in name)
+    return "linux_x86_64.whl" in name
+
 
 
 def verify_pynv_wheel(wheel, system):
-    if system != "Windows":
-        return
-
     digest = hashlib.sha256()
     with wheel.open("rb") as wheel_file:
         for chunk in iter(lambda: wheel_file.read(1024 * 1024), b""):
             digest.update(chunk)
-    if digest.hexdigest() != PYNV_WINDOWS_SHA256:
+    if digest.hexdigest() != PYNV_WHEEL_SHA256[system]:
         raise SetupError(
-            "The Windows PyNvVideoCodec wheel does not match the tested production build."
+            f"The {system} PyNvVideoCodec wheel does not match the tested production build."
         )
 
 
@@ -134,7 +137,7 @@ def find_pynv_wheel(script_dir, system, explicit_path=None):
 
     compatible = sorted(path for path in candidates if wheel_matches_platform(path, system))
     if not compatible:
-        platform_hint = "win_amd64" if system == "Windows" else "manylinux_x86_64"
+        platform_hint = "win_amd64" if system == "Windows" else "linux_x86_64"
         raise SetupError(
             "A modified PyNvVideoCodec 2.2.0 cp312 wheel is required. "
             f"Place the {platform_hint} wheel in the project 'wheels' directory "
@@ -175,7 +178,13 @@ def preflight(pynv_wheel=None):
 def install_cuda_stack(config, *, dry_run=False):
     print("\nInstalling the pinned CUDA stack...")
     pip_install(config["gpu"]["torch"]["pip_args"], dry_run=dry_run)
-    pip_install(["install", CUPY_REQUIREMENT], dry_run=dry_run)
+    cupy_requirement = (
+        CUPY_WINDOWS_REQUIREMENT
+        if config["system"] == "Windows"
+        else CUPY_LINUX_REQUIREMENT
+    )
+    pip_install(["install", cupy_requirement], dry_run=dry_run)
+    run_command([sys.executable, "-m", "pip", "check"], dry_run=dry_run)
     if config["system"] == "Windows":
         pip_install(["install", TRITON_WINDOWS_REQUIREMENT], dry_run=dry_run)
     pip_install(
@@ -228,7 +237,7 @@ def verify_environment(expected_sm):
 
     print(f"\nPyTorch: {torch.__version__}; CUDA architectures: {torch.cuda.get_arch_list()}")
     print(f"CuPy: {cp.__version__}; device CC: {cp.cuda.Device(0).compute_capability}")
-    print(f"PyNvVideoCodec: {nvc.__version__}")
+    print(f"PyNvVideoCodec: {nvc.__version__} ({nvc.__file__})")
     if expected_sm < 80:
         print("torch.compile was intentionally skipped on SM 7.5.")
 
