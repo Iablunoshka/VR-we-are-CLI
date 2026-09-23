@@ -8,6 +8,7 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
+compare_sbs.py
 
 # Virtual environments and local configuration
 .venv/
