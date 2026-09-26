@@ -122,7 +122,7 @@ class FragmentedMP4Output:
 
 
 class StreamingVideoMux:
-    def __init__(self, source, output, width, height, fps, codec, gpu_id):
+    def __init__(self, source, output, width, height, fps, codec,cq_num, gpu_id):
         self.encoder = None
         self.muxer = None
         self.demuxer = None
@@ -155,7 +155,7 @@ class StreamingVideoMux:
             self.encoder = nvc.CreateEncoder(
                 width, height, "NV12", False, gpu_id=gpu_id,
                 codec=encoder_codec, fps=str(fps), bf="0", preset="P1",
-                rc="constqp", constqp="21", gop=str(max(1, round(fps * 2))),
+                rc="vbr", cq=f"{cq_num}", bitrate="0", gop=str(max(1, round(fps * 2))),
                 idrperiod=str(max(1, round(fps * 2))), extra_output_delay="8",
                 split_encode_mode="NV_ENC_SPLIT_THREE_FORCED_MODE",
                 source_av_format_context=int(self.demuxer.GetAVFormatInputContext()),
@@ -246,9 +246,9 @@ class StreamingVideoMux:
 
 
 def nv12_encode_mux_worker(ready_queue, free_buffer_queue, video_path, output_path,
-                           fps, codec, ctx, profile_gpu=False):
+                           fps, codec,cq, ctx, profile_gpu=False):
     torch.cuda.set_device(ctx.gpu_id)
-    writer = StreamingVideoMux(video_path, output_path, ctx.W * 2, ctx.H,fps, codec, ctx.gpu_id)
+    writer = StreamingVideoMux(video_path, output_path, ctx.W * 2, ctx.H,fps, codec,cq, ctx.gpu_id)
     encode_ms = 0.0
     batches = 0
     try:
