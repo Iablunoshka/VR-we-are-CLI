@@ -112,11 +112,11 @@ class PipelineContext:
 
     @staticmethod
     def nv12_encode_worker(ready_queue, free_buffer_queue, video_path, output_path,
-                           fps, codec, ctx):
+                           fps, codec,cq, ctx):
         """Consume GPU results; flush NVENC and wait for the final FFmpeg mux."""
         from video_mux import nv12_encode_mux_worker
 
-        nv12_encode_mux_worker(ready_queue, free_buffer_queue, video_path, output_path,fps, codec, ctx)
+        nv12_encode_mux_worker(ready_queue, free_buffer_queue, video_path, output_path,fps, codec,cq, ctx)
 
     @staticmethod
     def video_worker_thread(save_queue: Queue,video_path, output_path: str, width: int, height: int, fps: float,codec: str,crf: int, cq: int,ctx):
