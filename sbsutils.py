@@ -42,6 +42,26 @@ def detect_nvenc_support():
 
     return success
     
+def quality_to_rate_control(codec, quality):
+    # Definitions of quality: (crf, cq_h264, cq_hevc)
+    if quality == "low":
+        crf, cq_h264, cq_hevc = 30, 36, 38
+    elif quality == "medium":
+        crf, cq_h264, cq_hevc = 26, 30, 28
+    elif quality == "high":
+        crf, cq_h264, cq_hevc = 23, 24, 22
+    else:
+        raise ValueError(f"Unknown quality: {quality}")
+        
+    if codec == "h264_nvenc":
+        cq = cq_h264
+    elif codec == "hevc_nvenc":
+        cq = cq_hevc
+    else:
+        cq = None
+        
+    return crf, cq
+    
 def clean_output_pngs(output_path: str, input_path: str, parser=None):
     """
     Deletes only PNG files from the folder output directory.
