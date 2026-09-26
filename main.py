@@ -22,6 +22,7 @@ from sbsutils import (
     load_preset,
     merge_with_preset,
     validate_config,
+    quality_to_rate_control
 )
 
 
@@ -144,6 +145,7 @@ def init_pipeline(
     # --- Detect and prepare input source ---
     # Depending on input_type, determine dimensions, FPS, and I/O codec, crf
     frame_count = 0
+    crf, cq = None, None
     if input_type == "video":
         cap = cv2.VideoCapture(video_path)
         ok, frame = cap.read()
@@ -176,12 +178,7 @@ def init_pipeline(
                 print("h264_nvenc not available — using encoder (hevc_nvenc).")
 
         # Definitions of quality
-        if video_quality == "low":
-            crf, cq = 30, 35
-        elif video_quality == "medium":
-            crf, cq = 26, 31
-        elif video_quality == "high":  
-            crf, cq = 23, 28
+        crf, cq = quality_to_rate_control(codec,video_quality)
             
     elif input_type == "folder":
         files = natsorted([f for f in os.listdir(video_path) if f.lower().endswith((".png", ".jpg", ".jpeg"))])
@@ -330,7 +327,7 @@ def init_pipeline(
                             
     if direct_nv12:
         ctx.processors = []
-        ctx.savers = [make_worker(PipelineContext.nv12_encode_worker,save_q,proc_q,video_path,output_path,fps,codec,ctx,)]
+        ctx.savers = [make_worker(PipelineContext.nv12_encode_worker,save_q,proc_q,video_path,output_path,fps,codec,cq,ctx,)]
     else:
         ctx.processors = [make_worker(PipelineContext.process_worker, proc_q, save_q)for _ in range(n_processors)]
 
